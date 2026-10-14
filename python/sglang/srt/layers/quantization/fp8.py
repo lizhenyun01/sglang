@@ -1049,6 +1049,22 @@ class Fp8LinearMethod(LinearMethodBase):
             else:
                 scale_packed = scale_fp32
             copy_or_rebind_param(layer, "weight_scale_inv_deepgemm", scale_packed)
+        elif backend.is_inferrock():
+            from sglang.srt.layers.quantization.inferrock_mxfp8 import (
+                swizzle_scale_to_sfatom,
+                weight_supported,
+            )
+
+            n, k = layer.weight.shape
+            if scale_u8 is None:
+                scale_u8 = layer.weight_scale_inv.data
+            # N % 128 != 0 has no SfAtom layout and no InferRock tile; keep the
+            # canonical row-major scale only, and apply() falls back to FlashInfer.
+            layer.weight_scale_inv_inferrock = (
+                swizzle_scale_to_sfatom(scale_u8.contiguous().view(torch.uint8))
+                if weight_supported(n=n, k=k)
+                else None
+            )
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
@@ -1270,6 +1286,12 @@ class Fp8LinearMethod(LinearMethodBase):
             elif backend.is_deep_gemm():
                 weight_scale = layer.weight_scale_inv_deepgemm
                 extra_kwargs["weight_scale_swizzled"] = layer.weight_scale_inv_swizzled
+            elif backend.is_inferrock():
+                # SfAtom-swizzled weight scale prepared at load time; keep the
+                # canonical UE8M0 scale as the FlashInfer fallback scale. None
+                # means the shape has no SfAtom layout, so the fallback runs.
+                weight_scale = layer.weight_scale_inv_inferrock
+                extra_kwargs["weight_scale_fallback"] = layer.weight_scale_inv
             else:
                 weight_scale = layer.weight_scale_inv
             if isinstance(x, tuple):
@@ -2009,6 +2031,16 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 layer.w2_weight.is_shuffled = True
                 layer._aiter_gate_up_interleaved = False
             return
+        elif self.use_mxfp8 and get_moe_a2a_backend().is_megamoe():
+            from sglang.srt.layers.moe.mega_moe import build_mega_moe_experts_weights
+
+            # DeepGEMM MegaMoE builds its own scale layout (transform_sf_into_required_layout),
+            # so keep the canonical per-32 UE8M0 scales instead of a runner-specific packing.
+            self._process_mxfp8_moe_weights(
+                layer, quantize=not self.quant_config.is_checkpoint_fp8_serialized
+            )
+            build_mega_moe_experts_weights(layer)
+            return
         elif self.use_mxfp8 and get_moe_a2a_backend().is_flashinfer_megamoe():
             from sglang.srt.layers.moe.flashinfer_megamoe import (
                 prepare_mxfp8_moe_weights_for_flashinfer_megamoe,
@@ -2309,6 +2341,20 @@ class Fp8MoEMethod(FusedMoEMethodBase):
 
         from sglang.srt.layers.quantization.mxfp8_block_convert import _ue8m0_to_fp32
 
+        def _quantize_canonical(weight: torch.Tensor):
+            """MXFP8 with the canonical row-major per-32 UE8M0 scale kept as-is.
+
+            MegaMoE derives its own scale layout from ``w13_weight_scale_inv`` in
+            ``build_mega_moe_experts_weights``, so no runner-specific packing here.
+            """
+            weight = weight.contiguous()
+            num_experts, m, k = weight.shape
+            assert k % 32 == 0, f"{k=} must be divisible by 32 for MXFP8"
+
+            weight_flat = weight.view(-1, k).contiguous()
+            qweight, scale_u8 = mxfp8_group_quantize(weight_flat)
+            return qweight.view_as(weight), scale_u8.view(num_experts, m, k // 32)
+
         def _quantize_for_deepgemm(weight: torch.Tensor):
             weight = weight.contiguous()
             num_experts, m, k = weight.shape
@@ -2347,7 +2393,10 @@ class Fp8MoEMethod(FusedMoEMethodBase):
             return _pack_moe_scale_for_deepgemm(scale_fp32)
 
         if quantize:
-            if _is_hip:
+            if get_moe_a2a_backend().is_megamoe():
+                w13_q, w13_s = _quantize_canonical(layer.w13_weight.data)
+                w2_q, w2_s = _quantize_canonical(layer.w2_weight.data)
+            elif _is_hip:
                 w13_q, w13_s_u8 = mxfp8_group_quantize(
                     layer.w13_weight.data.contiguous().view(
                         -1, layer.w13_weight.data.shape[-1]
@@ -2398,6 +2447,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 )
         else:
             if _is_hip:
+                w13_q = layer.w13_weight.data
+                w2_q = layer.w2_weight.data
+                w13_s = layer.w13_weight_scale_inv.data
+                w2_s = layer.w2_weight_scale_inv.data
+            elif get_moe_a2a_backend().is_megamoe():
+                # Canonical per-32 UE8M0 scales as serialized; MegaMoE re-lays them out.
                 w13_q = layer.w13_weight.data
                 w2_q = layer.w2_weight.data
                 w13_s = layer.w13_weight_scale_inv.data
