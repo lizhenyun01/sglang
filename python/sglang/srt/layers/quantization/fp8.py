@@ -1049,25 +1049,48 @@ class Fp8LinearMethod(LinearMethodBase):
             else:
                 scale_packed = scale_fp32
             copy_or_rebind_param(layer, "weight_scale_inv_deepgemm", scale_packed)
-        elif backend.is_inferrock():
-            from sglang.srt.layers.quantization.inferrock_mxfp8 import (
+        elif backend.is_halops():
+            from sglang.srt.layers.quantization.halops_mxfp8 import (
                 swizzle_scale_to_sfatom,
                 weight_supported,
             )
 
             n, k = layer.weight.shape
-            if scale_u8 is None:
-                scale_u8 = layer.weight_scale_inv.data
-            # N % 128 != 0 has no SfAtom layout and no InferRock tile; keep the
-            # canonical row-major scale only, and apply() falls back to FlashInfer.
-            layer.weight_scale_inv_inferrock = (
-                swizzle_scale_to_sfatom(scale_u8.contiguous().view(torch.uint8))
-                if weight_supported(n=n, k=k)
-                else None
-            )
+            if not weight_supported(n=n, k=k):
+                layer.weight_scale_inv_halops = None
+            elif getattr(layer, "weight_scale_inv_halops", None) is None:
+                if scale_u8 is None:
+                    scale_u8 = layer.weight_scale_inv.data
+                layer.weight_scale_inv_halops = swizzle_scale_to_sfatom(
+                    scale_u8.contiguous().view(torch.uint8)
+                )
 
     def _quantize_mxfp8_weights(self, layer: Module) -> None:
         weight = layer.weight.data
+        if self.mxfp8_dense_backend.is_halops():
+            from sglang.srt.layers.quantization.halops_mxfp8 import (
+                quantize_weight,
+                weight_supported,
+            )
+
+            if weight_supported(n=weight.shape[0], k=weight.shape[1]):
+                qweight, sf_sfatom, weight_scale = quantize_weight(weight)
+                layer.weight.data = qweight
+                layer.weight.requires_grad_(False)
+                if (
+                    hasattr(layer, "weight_scale_inv")
+                    and layer.weight_scale_inv is not None
+                ):
+                    layer.weight_scale_inv.data = weight_scale
+                    layer.weight_scale_inv.requires_grad_(False)
+                else:
+                    layer.register_parameter(
+                        "weight_scale_inv", Parameter(weight_scale, requires_grad=False)
+                    )
+                layer.weight_scale_inv.format_ue8m0 = True
+                layer.weight_scale_inv_halops = sf_sfatom
+                layer.input_scale = None
+                return
         qweight, weight_scale = mxfp8_group_quantize(weight)
         # Keep parameter objects to preserve weight_loader attrs for hot reload.
         layer.weight.data = qweight
@@ -1286,11 +1309,11 @@ class Fp8LinearMethod(LinearMethodBase):
             elif backend.is_deep_gemm():
                 weight_scale = layer.weight_scale_inv_deepgemm
                 extra_kwargs["weight_scale_swizzled"] = layer.weight_scale_inv_swizzled
-            elif backend.is_inferrock():
+            elif backend.is_halops():
                 # SfAtom-swizzled weight scale prepared at load time; keep the
                 # canonical UE8M0 scale as the FlashInfer fallback scale. None
                 # means the shape has no SfAtom layout, so the fallback runs.
-                weight_scale = layer.weight_scale_inv_inferrock
+                weight_scale = layer.weight_scale_inv_halops
                 extra_kwargs["weight_scale_fallback"] = layer.weight_scale_inv
             else:
                 weight_scale = layer.weight_scale_inv

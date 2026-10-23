@@ -352,7 +352,7 @@ class Fp8GemmRunnerBackend(Enum):
     DEEP_GEMM = "deep_gemm"
     TRITON = "triton"
     AITER = "aiter"
-    INFERROCK = "inferrock"
+    HALOPS = "halops"
 
     def is_auto(self) -> bool:
         return self == Fp8GemmRunnerBackend.AUTO
@@ -381,8 +381,8 @@ class Fp8GemmRunnerBackend(Enum):
     def is_aiter(self) -> bool:
         return self == Fp8GemmRunnerBackend.AITER
 
-    def is_inferrock(self) -> bool:
-        return self == Fp8GemmRunnerBackend.INFERROCK
+    def is_halops(self) -> bool:
+        return self == Fp8GemmRunnerBackend.HALOPS
 
 
 class Mxfp8DenseGemmBackend(Enum):
@@ -393,7 +393,7 @@ class Mxfp8DenseGemmBackend(Enum):
     FLASHINFER_CUTEDSL = "flashinfer_cutedsl"
     FLASHINFER_TRTLLM = "flashinfer_trtllm"
     DEEP_GEMM = "deep_gemm"
-    INFERROCK = "inferrock"
+    HALOPS = "halops"
     GFX95_DOT_SCALED = "gfx95_dot_scaled"
     # gfx950 native MXFP8: lane-ordered fp8 weight + ue8m0 scale bytes; untiled shapes keep bf16
     GFX95_MXFP8_NATIVE = "gfx95_mxfp8_native"
@@ -416,8 +416,8 @@ class Mxfp8DenseGemmBackend(Enum):
     def is_deep_gemm(self) -> bool:
         return self == Mxfp8DenseGemmBackend.DEEP_GEMM
 
-    def is_inferrock(self) -> bool:
-        return self == Mxfp8DenseGemmBackend.INFERROCK
+    def is_halops(self) -> bool:
+        return self == Mxfp8DenseGemmBackend.HALOPS
 
     def is_gfx95_dot_scaled(self) -> bool:
         return self == Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
@@ -754,17 +754,17 @@ def resolve_mxfp8_dense_gemm_backend() -> Mxfp8DenseGemmBackend:
             )
         return Mxfp8DenseGemmBackend.DEEP_GEMM
 
-    if backend.is_inferrock():
+    if backend.is_halops():
         if not get_platform().is_sm100:
             raise RuntimeError(
-                "MXFP8 dense GEMM requested via --fp8-gemm-backend=inferrock, but "
-                "the InferRock kernels are built for SM100 only."
+                "MXFP8 dense GEMM requested via --fp8-gemm-backend=halops, but "
+                "the HALOps kernels are built for SM100 only."
             )
-        from sglang.srt.layers.quantization.inferrock_mxfp8 import load_inferrock_gemm
+        from sglang.srt.layers.quantization.halops_mxfp8 import load_halops_gemm
 
-        # Raises with an install hint when the `infer_rock` wheel is missing.
-        load_inferrock_gemm()
-        return Mxfp8DenseGemmBackend.INFERROCK
+        # Raises with an install hint when the `halops` wheel is missing.
+        load_halops_gemm()
+        return Mxfp8DenseGemmBackend.HALOPS
 
     if _is_hip and _is_gfx95_supported:
         return Mxfp8DenseGemmBackend.GFX95_DOT_SCALED
@@ -890,12 +890,12 @@ def dispatch_w8a8_mxfp8_linear() -> Callable:
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cutlass")
     elif backend.is_flashinfer_cutedsl():
         return partial(flashinfer_mxfp8_blockscaled_linear, backend="cute-dsl")
-    elif backend.is_inferrock():
-        from sglang.srt.layers.quantization.inferrock_mxfp8_linear import (
-            inferrock_w8a8_mxfp8_linear_with_fallback,
+    elif backend.is_halops():
+        from sglang.srt.layers.quantization.halops_mxfp8_linear import (
+            halops_w8a8_mxfp8_linear_with_fallback,
         )
 
-        return inferrock_w8a8_mxfp8_linear_with_fallback
+        return halops_w8a8_mxfp8_linear_with_fallback
     elif backend.is_unsupported():
         return _unsupported_mxfp8_linear
 
@@ -1044,14 +1044,14 @@ def _dispatch_explicit_backend(backend: Fp8GemmRunnerBackend) -> Callable:
     elif backend.is_triton():
         return triton_w8a8_block_fp8_linear
 
-    elif backend.is_inferrock():
-        # InferRock has no block-128 FP8 GEMM: its dense kernel takes group-32
-        # MXFP8 operands only. Reaching here means a block-fp8 checkpoint was
-        # combined with --fp8-gemm-backend=inferrock, which would otherwise
-        # silently run this layer on a kernel the flag did not ask for.
+    elif backend.is_halops():
+        # HALOps has no block-128 FP8 GEMM: its dense kernel takes group-32 MXFP8
+        # operands only. Reaching here means a block-fp8 checkpoint was combined
+        # with --fp8-gemm-backend=halops, which would otherwise silently run this
+        # layer on a kernel the flag did not ask for.
         raise RuntimeError(
-            "--fp8-gemm-backend=inferrock requires MXFP8 (group-32) weights, but this "
-            "layer came from a block-fp8 checkpoint, which InferRock cannot serve. "
+            "--fp8-gemm-backend=halops requires MXFP8 (group-32) weights, but this "
+            "layer came from a block-fp8 checkpoint, which HALOps cannot serve. "
             "Run a BF16 checkpoint with --quantization mxfp8 (the online MXFP8 "
             "quantization), or use --fp8-gemm-backend=deep_gemm / flashinfer_cutlass "
             "for the block-fp8 checkpoint."
