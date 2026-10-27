@@ -12,7 +12,6 @@ from sglang.srt.layers.quantization.halops_mxfp8 import (
     HALOPS_MODE,
     HALOPS_SFATOM_ROW_ALIGN,
     load_halops_gemm,
-    row_padded,
 )
 from sglang.srt.runtime_context import get_platform
 
@@ -20,15 +19,14 @@ from sglang.srt.runtime_context import get_platform
 def halops_tile_available(*, m: int, n: int, has_bias: bool) -> bool:
     """Whether a HALOps w8a8-mxfp8 tile accepts this shape.
 
-    Without a bias every M works once N is 128-aligned: ``group_wise_quant`` rounds
-    M up to 128, so a short M keeps one whole tile, and the 128x128 and 256x128
-    tiles cover the rest. The only bias tile is a 256x128x128 pair tile, which
-    needs whole 256-row M tiles; a bias layer with a shorter (padded) M would raise
-    inside HALOps, so route it to the fallback instead.
+    N must be 128-aligned for the SfAtom weight-scale atoms. Any M works without
+    a bias; the bias epilogue has no per-row store predicate, so a bias layer
+    needs M to be a whole multiple of 256, and anything else goes to the fallback
+    rather than raising inside HALOps.
     """
     if n % HALOPS_SFATOM_ROW_ALIGN != 0:
         return False
-    return not has_bias or row_padded(m) % HALOPS_BIAS_M_ALIGN == 0
+    return not has_bias or m % HALOPS_BIAS_M_ALIGN == 0
 
 
 def _flashinfer_fallback(
@@ -128,18 +126,14 @@ def halops_w8a8_mxfp8_linear_with_fallback(
     # raw row-major pointers, so a strided view silently produces wrong numerics.
     input_2d = input.reshape(-1, k).contiguous()
 
-    # group_wise_quant rounds the row count up to 128 itself and returns data and
-    # SfAtom scale at that same height, which dense_gemm takes as M. Padding the
-    # input beforehand would only buy an extra copy for the same result.
     q_input, sfa = group_wise_quant(input_2d, mode=HALOPS_MODE, use_swizzle=True)
-    m_padded = q_input.shape[0]
 
     if bias is not None:
         # dense_gemm types the bias as the (always bf16) output element type.
         bias = bias.to(torch.bfloat16)
 
     # dense_gemm only writes bf16; cast back below for an fp16 layer.
-    output = torch.empty((m_padded, n), dtype=torch.bfloat16, device=input_2d.device)
+    output = torch.empty((m, n), dtype=torch.bfloat16, device=input_2d.device)
 
     dense_gemm(
         input=q_input,
@@ -153,4 +147,4 @@ def halops_w8a8_mxfp8_linear_with_fallback(
         mode=HALOPS_MODE,
     )
 
-    return output[:m].to(input.dtype).reshape(*input.shape[:-1], n)
+    return output.to(input.dtype).reshape(*input.shape[:-1], n)

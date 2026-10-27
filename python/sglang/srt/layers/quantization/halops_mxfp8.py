@@ -33,26 +33,15 @@ def load_halops_gemm():
         from halops import dense_gemm, group_wise_quant
     except ImportError as exc:
         raise RuntimeError(
-            "HALOps GEMM backend requested, but the `halops` package is not installed."
+            "HALOps GEMM backend requested, but the `halops` package is not installed. "
+            "Install it with: pip install 'sglang[halops]' "
+            "-f https://www.paddlepaddle.org.cn/packages/stable/cu132/halops/"
         ) from exc
     return dense_gemm, group_wise_quant
 
 
 def weight_supported(*, n: int, k: int) -> bool:
     return k % HALOPS_K_ALIGN == 0 and n % HALOPS_SFATOM_ROW_ALIGN == 0
-
-
-def row_padded(rows: int) -> int:
-    return -(-rows // HALOPS_SFATOM_ROW_ALIGN) * HALOPS_SFATOM_ROW_ALIGN
-
-
-def pad_rows(x: torch.Tensor, rows: int) -> torch.Tensor:
-    """Zero-extend ``x`` to ``rows`` rows; returns ``x`` itself when already that tall."""
-    if x.shape[0] == rows:
-        return x
-    padded = x.new_zeros((rows, *x.shape[1:]))
-    padded[: x.shape[0]] = x
-    return padded
 
 
 def swizzle_scale_to_sfatom(scale_u8: torch.Tensor) -> torch.Tensor:

@@ -106,6 +106,16 @@ name = "pypi"
 url = "https://pypi.org/simple"
 default = true
 
+# HALOps is not on PyPI. explicit = true keeps this index out of the resolution
+# for every package except the ones pinned in [tool.uv.sources] below.
+[[tool.uv.index]]
+name = "paddle-cu132"
+url = "https://www.paddlepaddle.org.cn/packages/stable/cu132/"
+explicit = true
+
+[tool.uv.sources]
+halops = { index = "paddle-cu132" }
+
 [project.optional-dependencies]
 checkpoint-engine = ["checkpoint-engine==0.1.2"]
 instanttensor = ["instanttensor>=0.1.9"]
@@ -158,6 +168,13 @@ http2 = [
 
 fastokens = [
   "fastokens>=0.3.2",
+]
+
+halops = [
+  # PaddlePaddle's CUDA 13.2 index publishes only cp312 Linux wheels today, so
+  # the marker makes this extra a no-op elsewhere instead of failing resolution.
+  # Drop it once cp311/cp313 wheels appear.
+  "halops==0.1.0 ; python_version == '3.12' and sys_platform == 'linux'",
 ]
 
 test = [
