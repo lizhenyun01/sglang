@@ -45,6 +45,8 @@ from sglang.srt.layers.utils.common import add_prefix
 from sglang.srt.mem_cache.deepseek_v4_memory_pool import DeepSeekV4TokenToKVPool
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch
 from sglang.srt.model_executor.forward_context import get_attn_backend
+from sglang.srt.model_executor.runner import get_is_capture_mode
+from sglang.srt.models import ernie55_fused_ar_mhc_dispatch as ar_mhc
 from sglang.srt.models.deepseek_v4 import _apply_wo_a_bf16_matmul
 from sglang.srt.models.deepseek_v4_dspark import (
     _PAD_NUM_HEADS,
@@ -53,6 +55,7 @@ from sglang.srt.models.deepseek_v4_dspark import (
     _resolve_dspark_pool,
     build_dspark_v4_confidence_head,
 )
+from sglang.srt.models.deepseek_v4_mhc import AttnOutput
 from sglang.srt.models.dspark import gather_and_crop_vocab, project_through_lm_head
 from sglang.srt.models.ernie55 import (
     Ernie5_5DecoderLayer,
@@ -100,16 +103,35 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
         q, _ = self.wq_a(x)
         return self._gated_q_norm_rope(self.q_norm(q), positions, q_out)
 
+    def _clear_fast_state(self, forward_batch: ForwardBatch) -> None:
+        """Internal dspark_attention._clear_fast_state: no HCA-layer swapab seam
+        (q-norm-rope fold, deferred gate, late c128 tile) may reach this draft's
+        swapab decode, which runs none of them."""
+        self.attn._eb5_raw_q16 = None
+        forward_batch._eb5_swapab_qnr = None
+        forward_batch._eb5_gate_issuer = None
+        forward_batch._eb5_partial_done_event = None
+        forward_batch._eb5_compressor_stream = None
+
     def forward(
-        self, x: torch.Tensor, positions: torch.Tensor, forward_batch: ForwardBatch
-    ) -> torch.Tensor:
-        """The HCA attention's signature, so ``Ernie5_5DecoderLayer`` drives it."""
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch: ForwardBatch,
+        x_quant=None,
+        defer_all_reduce: bool = False,
+    ):
+        """The HCA attention's signature, so ``Ernie5_5DecoderLayer`` drives it.
+        ``x_quant``: a group-32 (fp8, uint8) of ``x`` for wkv / wq_a. With
+        ``defer_all_reduce`` a TP-reducing wo_b returns its rows un-reduced, as
+        AttnOutput, for the attention-side fused mHC kernel."""
         # Idle ranks have no draft KV rows but still join the MoE collectives.
         if forward_batch.forward_mode.is_idle():
             return torch.zeros_like(x)
         pool = _resolve_dspark_pool()
         attn_backend = get_attn_backend()
-        kv = self.kv_proj_only(x)
+        x_linear = x if x_quant is None else x_quant
+        kv = self.kv_proj_only(x_linear)
         self._store_block_kv(
             kv=kv,
             positions=positions,
@@ -121,7 +143,8 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
         if self.n_local_heads < _PAD_NUM_HEADS:
             q_padded = x.new_empty(x.shape[0], _PAD_NUM_HEADS, self.head_dim)
             q_out = q_padded[:, : self.n_local_heads]
-        q = self._compute_q(x, positions, q_out=q_out)
+        q = self._compute_q(x_linear, positions, q_out=q_out)
+        self._clear_fast_state(forward_batch)
         o = attn_backend.forward(
             q=q if q_padded is None else q_padded,
             k=kv,
@@ -132,6 +155,7 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
             attn_sink=self._local_attn_sink(),
             save_kv_cache=False,
         )
+        self._clear_fast_state(forward_batch)
         o = o[:, : self.n_local_heads]
         fused_rope_inplace(
             o[..., -self.rope_head_dim :],
@@ -150,8 +174,9 @@ class Ernie5_5DSparkAttention(Ernie5_5GatedQMixin, DSparkAttention):
         o = fused_sigmoid_mul(
             o.reshape(o.shape[0], -1), self._take_gate(), round_sigmoid=True
         )
-        out, _ = self.wo_b(o)
-        return out
+        defer_all_reduce = defer_all_reduce and self.wo_b.reduce_results
+        out, _ = self.wo_b(o, skip_all_reduce=defer_all_reduce)
+        return AttnOutput(out) if defer_all_reduce else out
 
 
 class Ernie5_5DSparkStage(Ernie5_5DecoderLayer):
@@ -181,6 +206,16 @@ class Ernie5_5DSparkStage(Ernie5_5DecoderLayer):
         return Ernie5_5DSparkAttention(
             config, layer_id, quant_config, prefix, alt_streams
         )
+
+    def _fused_ar_mhc_runs(self, gate, forward_batch, num_tokens):
+        # Internal draft: the fused mHC kernels run only in graph capture.
+        return get_is_capture_mode() and super()._fused_ar_mhc_runs(
+            gate, forward_batch, num_tokens
+        )
+
+    def _plan_deferral(self, *, attn_runs: bool, moe_runs: bool):
+        # Internal's draft stages finish every comb in-kernel.
+        return ar_mhc.SinkhornDeferral()
 
 
 class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
@@ -343,8 +378,20 @@ class Ernie5_5_MoeForCausalLMDSpark(nn.Module):
             x = input_embeds
         # The draft stages are not the target's layers the recorder counts.
         with get_global_expert_distribution_recorder().disable_this_region():
-            for stage in self.stages:
-                x = stage(positions, x, forward_batch, None)
+            if self.stages[0].fused_ar_mhc_attn_gate.enabled and x.shape[0] > 0:
+                # Each FFN mhc_post carried into the next stage, so its boundary
+                # can run the MoE-side fused kernel (internal forward_fused).
+                residual = post = comb = None
+                for stage in self.stages:
+                    x, residual, post, comb = stage(
+                        positions, x, forward_batch, None,
+                        prev_residual=residual, prev_post=post, prev_comb=comb,
+                        defer_ffn_hc_post=True,
+                    )  # fmt: skip
+                x = self.stages[-1]._hc_post(x, residual, post, comb)
+            else:
+                for stage in self.stages:
+                    x = stage(positions, x, forward_batch, None)
         return LogitsProcessorOutput(next_token_logits=None, hidden_states=x)
 
     def compute_base_logits(self, x: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:

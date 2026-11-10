@@ -2689,6 +2689,23 @@ class DeepseekSparseAttnBackend(
                 else:
                     kv_cache = _cat([k, k_rope], dim=-1)
 
+            if dsa_impl == "flashmla_sparse" and getattr(
+                self, "flashmla_sparse_split_q", False
+            ):
+                # ERNIE 5.5 MLA (SGLANG_ERNIE55_MLA_SWAPAB): its swapAB kernels
+                # read q split; the sub-backend concatenates when they decline.
+                return self._forward_flashmla_sparse(
+                    q_all=q_all,
+                    q_nope=q_nope if q_all is None else None,
+                    q_rope=q_rope if q_all is None else None,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                    topk_length=metadata.dsa_cache_seqlens_int32,
+                    attn_sink=attn_sink,
+                    forward_batch=forward_batch,
+                )
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             if dsa_impl == "triton_sparse_mla":
@@ -2891,6 +2908,20 @@ class DeepseekSparseAttnBackend(
             )
 
         if dsa_impl == "flashmla_sparse":
+            if getattr(self, "flashmla_sparse_split_q", False):
+                # ERNIE 5.5 MLA (SGLANG_ERNIE55_MLA_SWAPAB): see forward_extend.
+                return self._forward_flashmla_sparse(
+                    q_all=q_all,
+                    q_nope=q_nope if q_all is None else None,
+                    q_rope=q_rope if q_all is None else None,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=layer.scaling,
+                    v_head_dim=layer.v_head_dim,
+                    topk_length=metadata.dsa_cache_seqlens_int32,
+                    attn_sink=attn_sink,
+                    forward_batch=forward_batch,
+                )
             if q_rope is not None:
                 q_all = concat_mla_absorb_q_general(q_nope, q_rope)
             return self._forward_flashmla_sparse(

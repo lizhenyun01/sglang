@@ -4486,6 +4486,30 @@ class DeepseekV4AttnBackend(
                     extra_topk_lengths=extra_topk_lengths,
                 )
 
+            if envs.SGLANG_ERNIE55_SWAPAB_DECODE.get():
+                from sglang.srt.models.ernie55_swapab_decode import (
+                    maybe_swapab_decode,
+                )
+
+                swapab_out = maybe_swapab_decode(
+                    q=q,
+                    forward_batch=forward_batch,
+                    tp_q_head_num=layer.tp_q_head_num,
+                    head_dim_v=self.head_dim_v,
+                    softmax_scale=self.softmax_scale,
+                    swa_k_cache=swa_k_cache,
+                    swa_page_indices=swa_page_indices,
+                    swa_topk_lengths=swa_topk_lengths,
+                    attn_sink=attn_sink,
+                    extra_k_cache=extra_k_cache,
+                    extra_indices_in_kvcache=extra_indices,
+                    extra_topk_lengths=extra_topk_lengths,
+                    # Raw 16-head q of the HCA layer's q-norm-rope fold.
+                    raw_q16=getattr(layer, "_eb5_raw_q16", None),
+                )
+                if swapab_out is not None:
+                    return swapab_out
+
             if (
                 self.is_dsv41
                 and get_platform().is_sm100

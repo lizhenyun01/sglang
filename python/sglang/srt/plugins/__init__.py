@@ -137,5 +137,17 @@ def load_plugins():
         finally:
             _current_plugin_source.reset(token)
 
+    # ERNIE5.5 single-batch LL dense-GEMM backend: self-guards on
+    # SGLANG_ERNIE55_SINGLE_BATCH_LL (default off) and HALOps availability, so
+    # this is a no-op on every path that does not opt in.
+    try:
+        from sglang.srt.layers.quantization.ernie55_halops_ll_gemm import (
+            register_ernie55_halops_ll_gemm_patch,
+        )
+
+        register_ernie55_halops_ll_gemm_patch()
+    except Exception:
+        logger.exception("Failed to register ERNIE5.5 LL GEMM patch")
+
     # Apply all registered hooks (idempotent — already-patched targets are skipped).
     HookRegistry.apply_hooks()

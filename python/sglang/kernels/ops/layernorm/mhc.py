@@ -1638,6 +1638,7 @@ def mhc_fused_post_pre(
     *,
     norm_weight: torch.Tensor | None = None,
     norm_eps: float | None = None,
+    eps_outside_sqrt: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
     """Fuse the boundary between one mHC post step and the next mHC pre step.
 
@@ -1845,6 +1846,7 @@ def mhc_fused_post_pre(
             n_splits,
             hc_mult,
             hc_mult3,
+            eps_outside_sqrt,
         )
     else:
         # Same mhc_pre finalization without the model-layer RMSNorm.
@@ -1866,6 +1868,7 @@ def mhc_fused_post_pre(
             n_splits,
             hc_mult,
             hc_mult3,
+            eps_outside_sqrt,
         )
 
     return (

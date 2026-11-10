@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import contextlib
 import dataclasses
+import logging
 from typing import TYPE_CHECKING, Optional
 
 import torch
@@ -33,6 +34,7 @@ import torch
 from sglang.kernels.ops.attention.dsv4.sparse_prefill_kernels import (
     SPARSE_PREFILL_TOPK_ALIGNMENT,
 )
+from sglang.kernels.ops.attention.utils import concat_mla_absorb_q_general
 from sglang.srt.layers.attention.base_attn_backend import SharedReadEnds
 from sglang.srt.layers.attention.deepseek_v4_backend import (
     DEFAULT_INDEX_TOPK,
@@ -48,12 +50,21 @@ from sglang.srt.model_executor.forward_context import (
     forward_context,
     get_forward_context,
 )
+from sglang.srt.models.ernie55_swapab_dsa import (
+    maybe_swapab_dsa,
+    maybe_swapab_dsa_early,
+    mla_swapab_enabled,
+)
 from sglang.srt.state_capturer.indexer_topk import get_global_indexer_capturer
 
 if TYPE_CHECKING:
     from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     from sglang.srt.model_executor.forward_mode import ForwardMode
     from sglang.srt.model_executor.model_runner import ModelRunner
+
+logger = logging.getLogger(__name__)
+# Tokens of the first LL DSA prepare whose early-window swapAB form declined.
+_EARLY_DECLINED: list = []
 
 
 class _MlaSubBackendView:
@@ -99,6 +110,8 @@ class Ernie5_5MlaAttnBackend(DeepseekSparseAttnBackend):
         self._captured_sched_meta = []
         # Bool mask of the rows whose output is read; set only inside read_rows().
         self._read_rows: Optional[torch.Tensor] = None
+        # The DSA seams hand q split to _forward_flashmla_sparse (swapAB reads it so).
+        self.flashmla_sparse_split_q = mla_swapab_enabled()
 
     @contextlib.contextmanager
     def read_rows(self, rows: Optional[torch.Tensor], num_rows: int):
@@ -159,24 +172,92 @@ class Ernie5_5MlaAttnBackend(DeepseekSparseAttnBackend):
             self._graph_sched_meta = {}
         super().init_forward_metadata_out_graph(forward_batch, in_capture=in_capture)
 
+    def eb5_window_rows(self, num_rows: int):
+        """LL DSA prepare (internal ``dsa_full.eb5_window_rows``): the window half
+        of ``append_window_to_topk``'s rows from metadata alone, as (rows with
+        only the window columns written, row lengths, top-k column counts); None
+        without a window."""
+        if self.window <= 0:
+            return None
+        from sglang.kernels.ops.attention.dsa.append_window_to_topk import (
+            swa_window_rows_triton,
+        )
+
+        metadata = self.forward_metadata
+        ragged_offsets = metadata.topk_indices_offset
+        paged = ragged_offsets is None
+        return swa_window_rows_triton(
+            metadata.dsa_seqlens_expanded[:num_rows],
+            num_rows=num_rows,
+            topk=self.dsa_index_topk,
+            window=self.window,
+            alignment=SPARSE_PREFILL_TOPK_ALIGNMENT,
+            page_table=metadata.real_page_table if paged else None,
+            page_size=int(metadata.page_size),
+            page_row_indices=metadata.token_to_batch_idx if paged else None,
+            ragged_offsets=ragged_offsets,
+        )
+
     def _forward_flashmla_sparse(
         self,
-        q_all: torch.Tensor,
+        q_all: Optional[torch.Tensor],
         kv_cache: torch.Tensor,
         v_head_dim: int,
         page_table_1: torch.Tensor,
         sm_scale: float,
         topk_length: Optional[torch.Tensor] = None,
         attn_sink: Optional[torch.Tensor] = None,
+        q_nope: Optional[torch.Tensor] = None,
+        q_rope: Optional[torch.Tensor] = None,
+        forward_batch: Optional[ForwardBatch] = None,
     ) -> torch.Tensor:
         """Attention reads ``top-k plus the last window``; a bf16 cache here is
-        a bf16 pool or prefill's dequantized copy, and takes the parent's kernel."""
+        a bf16 pool or prefill's dequantized copy, and takes the parent's kernel.
+
+        ``q_nope``/``q_rope`` (with ``q_all`` None) come only from the
+        ``flashmla_sparse_split_q`` seam (SGLANG_ERNIE55_MLA_SWAPAB): the native
+        16-head swapAB partial reads them split, the stock kernels get the concat.
+        """
         from sglang.kernels.ops.attention.dsa.append_window_to_topk import (
             append_window_to_topk,
         )
 
         metadata = self.forward_metadata
-        num_rows = q_all.shape[0]
+        num_rows = (q_all if q_all is not None else q_nope).shape[0]
+        swapab = (
+            mla_swapab_enabled()
+            and self._read_rows is None
+            and kv_cache.dtype == torch.bfloat16
+        )
+        early = (
+            None
+            if forward_batch is None
+            else getattr(forward_batch, "_eb5_dsa_early", None)
+        )
+        if early is not None:
+            # LL DSA prepare built the window rows off the top-k path; the
+            # partial reads the top-k columns from page_table_1.
+            forward_batch._eb5_dsa_early = None
+            out = None
+            if swapab:
+                out = maybe_swapab_dsa_early(
+                    early=early,
+                    kv_cache=kv_cache,
+                    page_table_1=page_table_1,
+                    sm_scale=sm_scale,
+                    v_head_dim=v_head_dim,
+                    q_nope=q_nope,
+                    q_rope=q_rope,
+                )
+            if out is not None:
+                return out
+            if not _EARLY_DECLINED:
+                _EARLY_DECLINED.append(num_rows)
+                logger.warning(
+                    "LL DSA prepare: swapAB early-window path declined (tokens %d), "
+                    "stock append + partial used",
+                    num_rows,
+                )
         page_table_1, topk_length = append_window_to_topk(
             page_table_1[:num_rows].to(torch.int32),
             metadata.dsa_seqlens_expanded,
@@ -190,6 +271,52 @@ class Ernie5_5MlaAttnBackend(DeepseekSparseAttnBackend):
         keep = self._read_rows
         if keep is not None and kv_cache.dtype == torch.bfloat16:
             topk_length = topk_length.masked_fill(~keep, 0)
+        if swapab:
+            out = maybe_swapab_dsa(
+                q_all=q_all,
+                q_nope=q_nope,
+                q_rope=q_rope,
+                kv_cache=kv_cache,
+                page_table_1=page_table_1,
+                sm_scale=sm_scale,
+                v_head_dim=v_head_dim,
+                topk_length=topk_length,
+                attn_sink=attn_sink,
+            )
+            if out is not None:
+                return out
+        if q_all is None:
+            q_all = concat_mla_absorb_q_general(q_nope, q_rope)
+        if (
+            mla_swapab_enabled()
+            and kv_cache.dtype == torch.bfloat16
+            and q_all.shape[1] < 64
+            and 64 % q_all.shape[1] == 0
+        ):
+            # Internal pads h_q to ceil_align(heads, 64), not the parent's 128.
+            num_heads = q_all.shape[1]
+            q = q_all.new_zeros((num_rows, 64, q_all.shape[2]))
+            q[:, :num_heads] = q_all
+            sink = attn_sink
+            if attn_sink is not None:
+                key = (attn_sink.data_ptr(), 64)
+                sink = self._sink_pad_cache.get(key)
+                if sink is None:
+                    sink = attn_sink.new_zeros(64)
+                    self._sink_pad_cache[key] = sink
+                sink[:num_heads].copy_(attn_sink)
+            if topk_length is not None and topk_length.shape[0] != num_rows:
+                topk_length = None
+            o, _, _ = self._call_flash_mla_sparse_fwd(
+                q=q,
+                kv=kv_cache,
+                indices=page_table_1.unsqueeze(1),
+                sm_scale=sm_scale,
+                d_v=v_head_dim,
+                attn_sink=sink,
+                topk_length=topk_length,
+            )
+            return o[:, :num_heads]
         if kv_cache.dtype == torch.bfloat16 and q_all.shape[1] == 64:
             # The parent pads q to 128 heads on Blackwell; the 64-head build skips
             # that copy and half the work.
@@ -289,12 +416,18 @@ class Ernie5_5AttnBackend(DeepseekV4AttnBackend):
             qk_rope_head_dim=hf_config.hybrid_mla_qk_rope_head_dim,
             kv_lora_rank=hf_config.hybrid_mla_kv_lora_rank,
         )
+        mla_view_fields = {}
+        if mla_swapab_enabled():
+            # The latent sub-pool is bf16 under the flag (Ernie5_5TokenToKVPool);
+            # the DSA validators must see that, not the HCA pools' dtype.
+            mla_view_fields["kv_cache_dtype"] = torch.bfloat16
         self.mla_attn_backend = Ernie5_5MlaAttnBackend(
             _MlaSubBackendView(
                 model_runner,
                 model_config=mla_model_config,
                 token_to_kv_pool=pool.mla_kv_pool,
                 page_size=DSA_PAGE_SIZE,
+                **mla_view_fields,
             ),
             window=hf_config.sliding_window,
             # A multi-step draft step reads its own slice of the shared KV locs.

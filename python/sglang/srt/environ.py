@@ -330,6 +330,99 @@ class Envs:
     SGLANG_EXTERNAL_MM_MODEL_ARCH = EnvStr("")
     SGLANG_EXTERNAL_MM_PROCESSOR_PACKAGE = EnvStr("")
 
+    # ERNIE 5.5: fuse the whole small-batch decode MoE of a layer into one HALOps
+    # ``low_latency_moe`` launch (router .. AllReduce + RMSNorm + fc2 tail). Needs a
+    # 4-GPU TP group on SM100; off by default. QUANT picks the recipe
+    # ("w8a8-blockwise" or "w8a8-mxfp8"); ONLY keeps no fallback expert weights.
+    SGLANG_ERNIE55_MEGA_MOE = EnvBool(False)
+    SGLANG_ERNIE55_MEGA_MOE_ONLY = EnvBool(False)
+    SGLANG_ERNIE55_MEGA_MOE_QUANT = EnvStr("w8a8-blockwise")
+    # For the w8a8-mxfp8 recipe: quantize the mega operands (experts, latent fc1,
+    # shared up/down) natively per 1x32 group from BF16, instead of deriving the
+    # SfAtom scale from the block128 weight. fc2 stays block128 (its kernel is not on
+    # group32 yet). Off falls back to the derived scale; no-op for w8a8-blockwise.
+    SGLANG_ERNIE55_MEGA_MOE_TRUE_GROUP32 = EnvBool(True)
+    # Extend native group32 to the routed experts too. Off by default: unlike the tiny
+    # latent/shared operands, a second expert copy is ~69 GB/rank, and the prefill
+    # fallback still needs the block128 experts, so both together OOM until the FP4
+    # (w4a8-mxfp4) prefill path replaces the block128 experts. Turn on only when the
+    # block128 expert fallback is not kept (no large-batch prefill on this rank).
+    SGLANG_ERNIE55_MEGA_MOE_TRUE_GROUP32_EXPERTS = EnvBool(False)
+    # Route the ERNIE5.5 w4a8-mxfp4 *prefill* routed experts through the HALOps
+    # ``w4a8_group_contiguous_gemm`` on a packed-FP4 (E2M1) expert copy laid out
+    # like the decode ``low_latency_moe`` kernel reads it, instead of the block128
+    # FP8 experts. Drops the ~69 GB/rank block128 FP8 copy; only meaningful with
+    # SGLANG_ERNIE55_MEGA_MOE_QUANT="w4a8-mxfp4". Off by default so the verified
+    # decode-only path is untouched (the mega kernel keeps its own FP4 copy).
+    SGLANG_ERNIE55_W4A8_PREFILL = EnvBool(False)
+    # Online 128x128 blockwise-FP8 quant of a BF16 ernie5.5 checkpoint, so the
+    # mega-MoE kernel's experts/dense modules carry weight_scale_inv without a
+    # pre-serialized FP8 checkpoint (see layers/quantization/ernie55_blockwise_fp8.py).
+    SGLANG_ERNIE55_ONLINE_BLOCKWISE_FP8 = EnvBool(False)
+    # Fuse each ERNIE5.5 decoder layer's attention mHC-post and FFN mHC-pre into a
+    # single mhc_fused_post_pre launch (the fused kernel DeepSeek-V4 already uses),
+    # removing one kernel launch per layer on the decode hot path. Carries the
+    # ERNIE5.5 training-formula eps (eps_outside_sqrt=True). Off by default so the
+    # verified split mhc_pre/mhc_post path is untouched.
+    SGLANG_ERNIE55_FUSE_MHC_POST_PRE = EnvBool(False)
+
+    # ERNIE 5.5 single-batch LL dense-GEMM backend: route eligible BF16 dense
+    # (non-MoE, block-quant, N%8==0 / K%256==0) layers through HALOps
+    # low_latency_mma_gemm on a group-32 FP8 weight copy, for decode-sized M
+    # (1..16) in CUDA-graph capture. SM100 + HALOps only; off by default so the
+    # verified DeepGEMM block-quant / W4A8 decode path is untouched. This is the
+    # consumer the fused HCA qkv_prep's FP8 q-output feeds into.
+    SGLANG_ERNIE55_SINGLE_BATCH_LL = EnvBool(False)
+
+    # ERNIE5.5 HCA attention decode prep in one launch (internal
+    # eb5_hca_qkv_prep): fuse the q-role rmsnorm+group-32-fp8 quant and the
+    # k-role norm+rope+SWA-store into a single main-stream kernel, forking only
+    # the compressor side stream, mirroring internal prepare_hca_qkv. Default
+    # off; requires SGLANG_ERNIE55_SINGLE_BATCH_LL (the fp8 q-output feeds wq_b
+    # through the group-32 LL GEMM). When off, the stock 3-stream path runs.
+    SGLANG_ERNIE55_HCA_QKV_PREP = EnvBool(False)
+
+    # ERNIE5.5 HCA SWA decode on the SM100-native 16-head swapAB gluon operator
+    # (internal eb5_swapab + swapab_decode): replaces the FlashMLA SWA decode in
+    # DeepseekV4AttnBackend with the gluon-partial native-16-head kernel, and at
+    # attn_tp>1 fuses the online-softmax combine with the attn-TP head gather into
+    # one NVLink push over the CustomAllReduceV2 push workspace
+    # (eb5_combine_push_global), replacing the NCCL ring all-gather on the decode
+    # critical path. Default off; independent of the compute-kernel switches so
+    # the validated g32/HCA-qkv-prep path is untouched. When off, the stock
+    # FlashMLA / open swapab_attention path runs.
+    SGLANG_ERNIE55_SWAPAB_DECODE = EnvBool(False)
+
+    # Fuse the swapAB online-softmax combine with the attn-TP head all-gather into
+    # one NVLink push over the CustomAllReduceV2 push workspace
+    # (eb5_combine_push_global), returning the global 64-head output so the VHA
+    # postmix skips its own gather (forward_batch._eb5_swapab_gathered). Requires
+    # SGLANG_ERNIE55_SWAPAB_DECODE. Default off: when off, SWAPAB_DECODE runs the
+    # local 16-head combine (identical downstream contract to the stock per-rank
+    # path, no postmix change). The cross-GPU push + postmix-skip composition is
+    # the piece that needs its own TP coherence pass before it goes on by default.
+    SGLANG_ERNIE55_SWAPAB_PUSH = EnvBool(False)
+
+    # Internal-alignment switches for the ERNIE5.5 bs=1 decode path (each mirrors
+    # the internal EB5 SINGLE_BATCH_LL implementation; all default off).
+    # HCA: q_up and the output gate as separate GEMMs (internal
+    # GATE_MERGE_QUP=0); the gate GEMM is issued on a side stream once the swapAB
+    # partial is enqueued and joined at wo_b.
+    SGLANG_ERNIE55_HCA_SPLIT_GATE = EnvBool(False)
+    # HCA: fold the q rmsnorm+rope into the swapAB partial (no fused_q_norm_rope).
+    SGLANG_ERNIE55_SWAPAB_QNR_FOLD = EnvBool(False)
+    # HCA: run the late c128 tile of the swapAB partial on the compressor stream
+    # (tile_mode 1/2 + late_sync), so the compressor join leaves the critical path.
+    SGLANG_ERNIE55_SWAPAB_LATE_C128 = EnvBool(False)
+    # Decoder: all-reduce + mhc_post + next sub-block mhc_pre in one kernel
+    # (internal fused_ar_mhc), chained across layers.
+    SGLANG_ERNIE55_FUSED_AR_MHC = EnvBool(False)
+    # Full-MLA (DSA) layers: bf16 latent KV sub-pool + native 16-head swapAB
+    # bf16 decode, multi-lane prepare and push-gathered postmix (internal
+    # EB5LLDsaPrepare / maybe_swapab_dsa_early).
+    SGLANG_ERNIE55_MLA_SWAPAB = EnvBool(False)
+
+
     # ===================================================================
     # HTTP server and health
     # ===================================================================

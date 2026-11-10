@@ -36,6 +36,7 @@ from sglang.srt.mem_cache.deepseek_v4_memory_pool import (
 from sglang.srt.mem_cache.hicache_storage import PoolName
 from sglang.srt.mem_cache.memory_pool import DSATokenToKVPool
 from sglang.srt.model_executor.pool_configurator import DSV4PoolConfigurator
+from sglang.srt.models.ernie55_swapab_dsa import mla_swapab_enabled
 from sglang.srt.runtime_context import get_exec, get_spec
 
 if TYPE_CHECKING:
@@ -54,10 +55,11 @@ def mla_layer_bytes_per_token(
     """
     kv_lora_rank = hf_config.hybrid_mla_kv_lora_rank
     rope_dim = hf_config.hybrid_mla_qk_rope_head_dim
-    # A bf16 latent row, or the FlashMLA FP8 one (656 B for 512 + 64).
+    # A bf16 latent row, or the FlashMLA FP8 one (656 B for 512 + 64). The
+    # native swapAB MLA decode reads a bf16 latent whatever the pool dtype.
     latent = (
         fp8_ds_mla_row_width(kv_lora_rank, rope_dim)
-        if kv_cache_dtype_str.startswith("fp8")
+        if kv_cache_dtype_str.startswith("fp8") and not mla_swapab_enabled()
         else (kv_lora_rank + rope_dim) * torch.bfloat16.itemsize
     )
     index_head_dim = hf_config.index_head_dim
@@ -134,7 +136,9 @@ class Ernie5_5TokenToKVPool(DeepSeekV4TokenToKVPool):
         # The model-wide allocator hands out slots up to full_size + page_size - 1,
         # while this pool pads by one of its own 64-token pages.
         size = self.full_size + self.page_size - DSA_PAGE_SIZE
-        fp8 = self.dtype == torch.float8_e4m3fn
+        # SGLANG_ERNIE55_MLA_SWAPAB: only the MLA sub-pool goes bf16 (internal
+        # ll_full_kv_bf16); the HCA pools keep their dtype.
+        fp8 = self.dtype == torch.float8_e4m3fn and not mla_swapab_enabled()
         self.mla_kv_pool = _LayerSubsetDSATokenToKVPool(
             owned_layer_ids=mla_layer_ids,
             layer_num=self._stage_end,

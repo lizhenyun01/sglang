@@ -171,3 +171,179 @@ def append_window_to_topk(
         num_warps=8,
     )
     return out, out_lengths
+
+
+# Window-only rows (port of internal ``mla_hca/dsa_swa_index.py``
+# ``swa_window_rows_triton``): the window half of the rows above, built before
+# the top-k exists (LL DSA prepare); the swapAB partial reads the columns below
+# each row's top-k count straight from the top-k output.
+_RAGGED = 0
+_PAGED_IDENTITY = 1
+_PAGED_MAPPED = 2
+
+
+@triton.jit
+def _swa_window_kernel(
+    seq_lens_ptr,
+    page_table_ptr,
+    row_aux_ptr,
+    output_ptr,
+    output_lengths_ptr,
+    indexer_lengths_ptr,
+    seq_lens_stride,
+    page_table_stride_row,
+    page_table_stride_col,
+    row_aux_stride,
+    output_stride_row,
+    output_stride_col,
+    live_rows,
+    page_table_rows,
+    page_table_cols,
+    TOPK: tl.constexpr,
+    WINDOW: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    MODE: tl.constexpr,
+    WINDOW_BLOCK: tl.constexpr,
+):
+    row = tl.program_id(0)
+    row_is_live = row < live_rows
+    seq_len = tl.load(
+        seq_lens_ptr + row * seq_lens_stride, mask=row_is_live, other=0
+    ).to(tl.int32)
+    seq_len = tl.maximum(seq_len, 0)
+    indexer_len = tl.minimum(tl.maximum(seq_len - WINDOW, 0), TOPK)
+    swa_len = tl.minimum(seq_len, WINDOW)
+
+    window_offset = tl.arange(0, WINDOW_BLOCK)
+    in_window = window_offset < WINDOW
+    valid = row_is_live & in_window & (window_offset < swa_len)
+    position = seq_len - swa_len + window_offset
+
+    if MODE == 0:
+        row_base = tl.load(
+            row_aux_ptr + row * row_aux_stride, mask=row_is_live, other=0
+        ).to(tl.int32)
+        values = row_base + position
+    else:
+        if MODE == 2:
+            page_row = tl.load(
+                row_aux_ptr + row * row_aux_stride, mask=row_is_live, other=0
+            ).to(tl.int64)
+        else:
+            page_row = row.to(tl.int64)
+        page_id = position // PAGE_SIZE
+        valid = (
+            valid
+            & (page_row >= 0)
+            & (page_row < page_table_rows)
+            & (page_id < page_table_cols)
+        )
+        page = tl.load(
+            page_table_ptr
+            + page_row * page_table_stride_row
+            + page_id * page_table_stride_col,
+            mask=valid,
+            other=0,
+        ).to(tl.int32)
+        values = page * PAGE_SIZE + position % PAGE_SIZE
+
+    tl.store(
+        output_ptr
+        + row * output_stride_row
+        + (indexer_len + window_offset) * output_stride_col,
+        tl.where(valid, values, -1),
+        mask=in_window,
+    )
+    tl.store(output_lengths_ptr + row, indexer_len + swa_len)
+    tl.store(indexer_lengths_ptr + row, indexer_len)
+
+
+def _row_map(seq_lens, page_table, page_row_indices, ragged_offsets):
+    live_rows = seq_lens.numel()
+    page_table_rows = page_table_cols = 0
+    page_table_stride_row = page_table_stride_col = 0
+    if ragged_offsets is not None:
+        mode, row_aux, page_table_arg = _RAGGED, ragged_offsets, seq_lens
+    else:
+        if page_row_indices is not None:
+            mode, row_aux = _PAGED_MAPPED, page_row_indices
+        elif page_table.shape[0] >= live_rows:
+            mode, row_aux = _PAGED_IDENTITY, seq_lens
+        else:
+            raise ValueError(
+                f"page table has {page_table.shape[0]} rows for {live_rows} live "
+                "query rows and no token_to_batch_idx to map them"
+            )
+        page_table_arg = page_table
+        page_table_rows, page_table_cols = page_table.shape
+        page_table_stride_row, page_table_stride_col = page_table.stride()
+    if row_aux.numel() < live_rows:
+        raise ValueError(
+            f"row map covers {row_aux.numel()} of {live_rows} live query rows"
+        )
+    return (
+        mode,
+        row_aux,
+        page_table_arg,
+        page_table_rows,
+        page_table_cols,
+        page_table_stride_row,
+        page_table_stride_col,
+    )
+
+
+def swa_window_rows_triton(
+    seq_lens: torch.Tensor,
+    *,
+    num_rows: int,
+    topk: int,
+    window: int,
+    alignment: int,
+    page_table: Optional[torch.Tensor] = None,
+    page_size: int = 1,
+    page_row_indices: Optional[torch.Tensor] = None,
+    ragged_offsets: Optional[torch.Tensor] = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """``append_window_to_topk``'s rows without the top-k columns: returns the
+    ``[num_rows, width]`` buffer with only the window columns written, the row
+    lengths, and the per-row top-k column count (the window starts there)."""
+    (
+        mode,
+        row_aux,
+        page_table_arg,
+        page_table_rows,
+        page_table_cols,
+        page_table_stride_row,
+        page_table_stride_col,
+    ) = _row_map(seq_lens, page_table, page_row_indices, ragged_offsets)
+    output_width = triton.cdiv(topk + window, alignment) * alignment
+    device = seq_lens.device
+    output = torch.empty((num_rows, output_width), dtype=torch.int32, device=device)
+    output_lengths = torch.empty(num_rows, dtype=torch.int32, device=device)
+    indexer_lengths = torch.empty(num_rows, dtype=torch.int32, device=device)
+    if num_rows == 0:
+        return output, output_lengths, indexer_lengths
+    _swa_window_kernel[(num_rows,)](
+        seq_lens,
+        page_table_arg,
+        row_aux,
+        output,
+        output_lengths,
+        indexer_lengths,
+        seq_lens.stride(0),
+        page_table_stride_row,
+        page_table_stride_col,
+        row_aux.stride(0),
+        output.stride(0),
+        output.stride(1),
+        seq_lens.numel(),
+        page_table_rows,
+        page_table_cols,
+        TOPK=topk,
+        WINDOW=window,
+        PAGE_SIZE=page_size,
+        MODE=mode,
+        WINDOW_BLOCK=triton.next_power_of_2(window),
+        num_warps=4,
+    )
+    return output, output_lengths, indexer_lengths

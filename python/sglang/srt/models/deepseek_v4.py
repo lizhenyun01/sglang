@@ -2972,7 +2972,11 @@ class MQALayer(MqaAttentionBase):
                     # HIP only, for the same reason as rope_kwargs above
                     **({} if inv_rope is None else {"inv_rope": inv_rope}),
                 )
-            o = o[:, tp_slice, :]
+            if not getattr(forward_batch, "_eb5_swapab_gathered", False):
+                # The fused swapab combine+push already returned the FULL 64 heads
+                # in global order (and the postmix will skip its own gather); the
+                # per-rank slice would wrongly keep only global heads [0, n_local).
+                o = o[:, tp_slice, :]
         o = self._project_wo_a(
             o,
             positions=positions,

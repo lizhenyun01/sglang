@@ -193,6 +193,17 @@ ACTIVATION_SCHEMES = ["static", "dynamic"]
 logger = logging.getLogger(__name__)
 _DENSE_MXSCALE_LOGGED: set = set()
 
+
+def _ernie55_w4a8_prefill_enabled() -> bool:
+    """True when the ERNIE5.5 w4a8-mxfp4 prefill FP4 runner is opted in: the
+    HALOps ``w4a8_group_contiguous_gemm`` serves the prefill routed experts off a
+    packed-FP4 copy instead of block128 FP8. Only meaningful with the mega MoE's
+    w4a8-mxfp4 recipe; off leaves every fp8 MoE layer on its normal path."""
+    return (
+        envs.SGLANG_ERNIE55_W4A8_PREFILL.get()
+        and envs.SGLANG_ERNIE55_MEGA_MOE_QUANT.get() == "w4a8-mxfp4"
+    )
+
 DSV4_DEQUANT_FP4_TABLE = torch.tensor(
     [
         0.0,
@@ -300,10 +311,17 @@ class Fp8Config(QuantizationConfig):
         self.packed_modules_mapping = packed_modules_mapping or {}
         self.use_mxfp8 = use_mxfp8
         self.kv_cache_quant_algo = kv_cache_quant_algo
+        # ERNIE 5.5: online 128x128 blockwise-FP8 from a BF16 checkpoint. Forces
+        # block quant without a pre-serialized FP8 ckpt; the weights are quantized
+        # at process_weights_after_loading (see ernie55_blockwise_fp8.py), the same
+        # load-time-quantizer pattern as the dsv4 mxfp8-HALOps path.
+        self.online_block_fp8 = envs.SGLANG_ERNIE55_ONLINE_BLOCKWISE_FP8.get()
+        if self.online_block_fp8 and weight_block_size is None:
+            weight_block_size = [128, 128]
         # "ue8m0" checkpoints quantize activations with power-of-two scales.
         self.scale_fmt = scale_fmt
         if weight_block_size is not None:
-            if not is_checkpoint_fp8_serialized:
+            if not is_checkpoint_fp8_serialized and not self.online_block_fp8:
                 raise ValueError(
                     "The block-wise quantization only supports fp8-serialized checkpoint for now."
                 )
@@ -699,7 +717,12 @@ class Fp8LinearMethod(LinearMethodBase):
         )
         layer.register_parameter("weight", weight)
 
-        if is_checkpoint_fp8_serialized:
+        # ERNIE 5.5 online blockwise-FP8 registers the block scale at build time
+        # too (not just for serialized ckpts), so construction-time asserts like
+        # DSV4 attention's `hasattr(wo_a, "weight_scale_inv")` hold; the real
+        # scale data is filled in process_weights_after_loading.
+        online_block_fp8 = getattr(quant_config, "online_block_fp8", False)
+        if is_checkpoint_fp8_serialized or online_block_fp8:
             if block_quant:
                 if hasattr(quant_config, "activation_scheme"):
                     assert quant_config.activation_scheme == "dynamic"
@@ -779,6 +802,19 @@ class Fp8LinearMethod(LinearMethodBase):
         if self.use_npu_block_fp8:
             # G-B consumes checkpoint-layout E4M3 weights and FP32 scales.
             return
+        if (
+            getattr(self.quant_config, "online_block_fp8", False)
+            and not self.is_checkpoint_fp8_serialized
+            and layer.weight.dtype != torch.float8_e4m3fn
+        ):
+            # ERNIE 5.5 online blockwise-FP8 from BF16: quantize in place (writes
+            # weight_scale_inv), then fall through so the block path treats the
+            # layer like a serialized block-FP8 checkpoint.
+            from sglang.srt.layers.quantization.ernie55_blockwise_fp8 import (
+                quantize_linear_online_block_fp8,
+            )
+
+            quantize_linear_online_block_fp8(layer)
         use_deepgemm_runner = (
             getattr(self.w8a8_block_fp8_linear, "func", self.w8a8_block_fp8_linear)
             is deepgemm_w8a8_block_fp8_linear_with_fallback
@@ -2015,6 +2051,40 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         logger.warning_once("Dequantized FP4 MoE expert weights to FP8.")
 
     def process_weights_after_loading_block_quant(self, layer: Module) -> None:
+        if (
+            _ernie55_w4a8_prefill_enabled()
+            and getattr(self.quant_config, "online_block_fp8", False)
+            and not self.quant_config.is_checkpoint_fp8_serialized
+            and layer.w13_weight.dtype == torch.bfloat16
+            and tuple(layer.w13_weight.shape) == (512, 1024, 2048)
+        ):
+            # ERNIE 5.5 w4a8-mxfp4 prefill: quantize the BF16 routed experts to ONE
+            # packed-FP4 copy (gran-8 pair layout) instead of block128 FP8, so the
+            # HALOps contiguous GEMM serves prefill off the FP4 weights. Gated by
+            # SGLANG_ERNIE55_W4A8_PREFILL; the shape guard keeps non-ERNIE fp8 MoE
+            # layers on the block path. The mega kernel keeps its own decode FP4 copy.
+            from sglang.srt.layers.quantization.ernie55_blockwise_fp8 import (
+                quantize_moe_experts_online_w4a8_fp4,
+            )
+
+            quantize_moe_experts_online_w4a8_fp4(layer)
+            return
+        if (
+            getattr(self.quant_config, "online_block_fp8", False)
+            and not self.quant_config.is_checkpoint_fp8_serialized
+            and layer.w13_weight.dtype != torch.float8_e4m3fn
+        ):
+            # ERNIE 5.5 online blockwise-FP8 of BF16 experts: produces fp8 experts
+            # + w13/w2_weight_scale_inv in the serialized block layout (UE8M0 on
+            # Blackwell), so the mega-MoE kernel and the deepgemm block fallback
+            # both consume them. Returns here because the quantizer already emits
+            # the final scale format; the serialized tail would only requant.
+            from sglang.srt.layers.quantization.ernie55_blockwise_fp8 import (
+                quantize_moe_experts_online_block_fp8,
+            )
+
+            quantize_moe_experts_online_block_fp8(layer)
+            return
         if _use_aiter and self.is_fp4_expert:
             # aiter MegaMoEv2 builds from the packed FP4 layout, so it has to
             # claim the experts before the native-MXFP4 and dequant arms.
@@ -3130,6 +3200,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
         self._owns_moe_runner = False
         self.moe_runner_config = moe_runner_config
 
+        if _ernie55_w4a8_prefill_enabled():
+            # ERNIE5.5 w4a8-mxfp4 prefill: the routed experts run the HALOps
+            # contiguous GEMM off the packed-FP4 copy. Importing the module
+            # self-registers the "halops" runner backend + its permute pair.
+            from sglang.srt.layers.moe.moe_runner import halops  # noqa: F401
+            from sglang.srt.layers.moe.utils import resolve_moe_runner_backend
+
+            self.runner = MoeRunner(
+                resolve_moe_runner_backend("halops"), moe_runner_config
+            )
+            self._owns_moe_runner = True
+            return
+
         # MXFP4 experts on NPU run through the ASCEND runner, which
         # quantizes activations internally.
         if _is_npu and self.is_fp4_expert:
@@ -3388,6 +3471,19 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 apply_routed_scaling_factor=(
                     not layer.should_fuse_routed_scaling_factor_in_topk
                 ),
+            )
+        elif self.runner.runner_backend.value == "halops":
+            # ERNIE5.5 w4a8-mxfp4 prefill: packed-FP4 experts (gran-8 w13) + 1x32
+            # fp32 group scales, consumed by the HALOps contiguous GEMM.
+            quant_info = DeepGemmMoeQuantInfo(
+                w13_weight=layer.w13_weight,
+                w2_weight=layer.w2_weight,
+                use_fp8=True,
+                w13_scale=layer.w13_weight_scale_inv,
+                w2_scale=layer.w2_weight_scale_inv,
+                block_shape=[1, 32],
+                is_fp4_experts=True,
+                use_mxfp8=False,
             )
         elif self.runner.runner_backend.is_deep_gemm():
             w13_weight = layer.w13_weight

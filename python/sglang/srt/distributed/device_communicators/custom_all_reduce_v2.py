@@ -202,6 +202,10 @@ class CustomAllReduceV2:
         self.max_size = max(self.max_pull_size, self.max_push_size)
         num_pull_blocks = base_config.num_pull_blocks
         num_push_blocks = base_config.num_push_blocks
+        if envs.SGLANG_ERNIE55_SINGLE_BATCH_LL.get():
+            # bs=1 decode pushes tiny messages: 128 CTAs keep the push latency
+            # and leave SMs to the overlapped GEMMs (internal ar_push_blocks_patch).
+            num_push_blocks = min(num_push_blocks, 128)
         if max_pull_blocks:
             num_pull_blocks = max(min(num_pull_blocks, max_pull_blocks), 1)
         if max_push_blocks is not None:

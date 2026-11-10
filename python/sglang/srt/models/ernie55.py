@@ -37,7 +37,7 @@ from sglang.kernels.ops.attention.dsv4 import fused_q_norm_rope, fused_rope_inpl
 from sglang.kernels.ops.attention.postmix_fp8_wo_a import postmix_fp8_wo_a_quant
 from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
 from sglang.kernels.ops.gemm.bf16_fp32 import linear_bf16_fp32
-from sglang.kernels.ops.layernorm.mhc import mhc_post, mhc_pre
+from sglang.kernels.ops.layernorm.mhc import mhc_fused_post_pre, mhc_post, mhc_pre
 from sglang.kernels.ops.layernorm.mhc_head import fused_hc_head
 from sglang.kernels.ops.moe.multi_router import multi_router_topk
 from sglang.srt.configs.ernie55 import Ernie5_5_MoeConfig
@@ -73,6 +73,11 @@ from sglang.srt.layers.logits_processor import (
     extend_reads_input_logprobs,
 )
 from sglang.srt.layers.moe.ep_moe.layer import get_moe_impl_class
+from sglang.srt.layers.moe.ernie55_mega_moe import (
+    Ernie55MegaMoE,
+    complete_shared_output,
+    shared_expert_sharded,
+)
 from sglang.srt.layers.moe.topk import TopK, TopKOutputFormat
 from sglang.srt.layers.moe.utils import get_moe_a2a_backend
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
@@ -109,6 +114,8 @@ from sglang.srt.models.deepseek_v4 import (
     make_hc_head_params,
     make_hc_mixing_params,
 )
+from sglang.srt.models import ernie55_fused_ar_mhc_dispatch as ar_mhc
+from sglang.srt.models.deepseek_v4_mhc import AttnOutput
 from sglang.srt.runtime_context import get_parallel
 from sglang.srt.utils import BumpAllocator, is_cuda
 
@@ -279,6 +286,13 @@ class Ernie5_5GatedQMixin:
         q = qg[:, : self.q_up_local_size].unflatten(
             1, (self.n_local_heads, self.head_dim)
         )
+        # swapAB q-norm-rope fold on the merged layout (internal q_b_merged);
+        # the draft attention has no LL backend.
+        ll = getattr(self, "_ll", None)
+        if ll is not None:
+            out = ll.q_b_merged(q, q_out)
+            if out is not None:
+                return out
         if q_out is None:
             q_out = q.new_empty(q.shape)
         fused_q_norm_rope(q, q_out, self.eps, self.freqs_cis, positions)
@@ -308,7 +322,31 @@ class Ernie5_5HcaAttention(Ernie5_5GatedQMixin, MQALayer):
             alt_streams=alt_streams,
         )
         self.postmix = VhaPostMix(self.n_local_heads, self.n_heads)
-        self._init_gated_wq_b(quant_config, prefix)
+        # SGLANG_ERNIE55_HCA_SPLIT_GATE (LowLatency only) keeps MQALayer's wq_b and
+        # adds a separate gate_proj, internal's layout under SINGLE_BATCH_LL, so
+        # the LL backend can run the gate on a side stream. Else [q_up | gate].
+        self.gate_merged_into_wq_b = not (
+            envs.SGLANG_ERNIE55_HCA_QKV_PREP.get()
+            and envs.SGLANG_ERNIE55_HCA_SPLIT_GATE.get()
+        )
+        if self.gate_merged_into_wq_b:
+            self._init_gated_wq_b(quant_config, prefix)
+        else:
+            self.gate_proj = ColumnParallelLinear(
+                self.q_lora_rank,
+                self.n_groups * self.o_lora_rank,
+                bias=False,
+                quant_config=quant_config,
+                prefix=add_prefix("gate_proj", prefix),
+                parallel_group="attn_tp",
+            )
+            self._gate: Optional[torch.Tensor] = None
+            self._gate_input = None
+            # Gate input = the q_norm latent; hook q_norm, the common point of
+            # MQALayer's q paths (prepare_hca_qkv replays it with its prequant).
+            self.q_norm.register_forward_hook(
+                lambda m, i, out: self._ll.capture_gate_input(m, i, out)
+            )
         # The mix fuses into the UE8M0 fp8 wo_a quant, but only from the folded
         # [H, H] matrix, which a split head axis has no rank-local form of.
         self._postmix_in_quant = (
@@ -317,11 +355,101 @@ class Ernie5_5HcaAttention(Ernie5_5GatedQMixin, MQALayer):
             and DEEPGEMM_SCALE_UE8M0
             and not self.postmix.sharded
         )
+        # LowLatency attention backend (dedicated file, default off). When on,
+        # the layer routes its prepare through self._ll.prepare_hca_qkv, which
+        # owns a clean internal-style forward (q_norm+g32-quant+kv-store fused
+        # into one main-stream launch, only the compressor forks). _ll is None
+        # => the stock MQALayer multi-stream path, byte-for-byte.
+        if envs.SGLANG_ERNIE55_HCA_QKV_PREP.get():
+            from sglang.srt.models.ernie55_ll_attn_backend import (
+                Ernie55LLAttnBackend,
+            )
+
+            self._ll = Ernie55LLAttnBackend(self, alt_streams)
+            if not self.gate_merged_into_wq_b:
+                self._ll.cap_wq_b_sms()
+        else:
+            self._ll = None
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        x_quant=None,
+        defer_all_reduce: bool = False,
+    ):
+        # Internal EB5AttentionCSAHCA.forward: arm the swapab fold / deferred gate
+        # seams, run MQALayer.forward, then the late joins + checks.
+        ll = self._ll if self._ll is not None and self._ll.engaged() else None
+        if ll is not None:
+            ll.arm_swapab(forward_batch, positions, x)
+        out = super().forward(
+            x,
+            positions,
+            forward_batch,
+            x_quant=x_quant,
+            defer_all_reduce=defer_all_reduce,
+        )
+        if ll is not None:
+            ll.end_forward()
+        return out
 
     def _compute_q_b(self, q, positions, q_out=None):
+        if not self.gate_merged_into_wq_b:
+            if self._ll is not None:
+                out = self._ll.q_b(q, positions, q_out)
+                if out is not None:
+                    return out
+            return super()._compute_q_b(q, positions, q_out)
         return self._gated_q_norm_rope(q, positions, q_out)
 
+    def _forward_prepare_multi_stream(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        forward_batch,
+        attn_backend,
+        q_out: Optional[torch.Tensor] = None,
+        x_quant=None,
+    ) -> torch.Tensor:
+        # In LowLatency mode the dedicated backend owns the forward; it returns
+        # (q, None) when it ran, or None to hand back to the stock path (its
+        # own readiness guard having declined), exactly as internal does.
+        if self._ll is not None:
+            prepared = self._ll.prepare_hca_qkv(
+                x, positions, forward_batch, attn_backend, q_out=q_out, x_quant=x_quant
+            )
+            if prepared is not None:
+                q, _ = prepared
+                return q
+        return super()._forward_prepare_multi_stream(
+            x, positions, forward_batch, attn_backend, q_out=q_out, x_quant=x_quant
+        )
+
     def _project_wo_a(self, o, *, positions, **kwargs):
+        # LowLatency: inverse-RoPE + cross-head postmix + wo_a fp8 quant folded
+        # into one kernel (ernie55_fused_postmix_rope_wo_a_quant). Returns the
+        # (fp8, int32-UE8M0) pair _fp8_wo_a_einsum consumes directly, same layout
+        # as postmix_fp8_wo_a_quant below; None hands control to the stock path.
+        if self._ll is not None:
+            # When the swapab decode fused the combine with the attn-TP head
+            # all-gather, `o` is already the full 64 heads in global order; tell
+            # the postmix to skip its own gather and consume them directly.
+            fb = kwargs.get("forward_batch")
+            gathered = bool(getattr(fb, "_eb5_swapab_gathered", False))
+            fused = self._ll.fused_postmix_rope_wo_a_quant(o, positions, gathered=gathered)
+            if fused is not None:
+                x_fp8, x_scale = fused
+                groups = self.n_local_groups
+                hidden = x_fp8.shape[-1]
+                return _fp8_wo_a_einsum(
+                    x_fp8,
+                    x_scale,
+                    self.wo_a.weight.view(groups, self.o_lora_rank, hidden),
+                    self.wo_a.weight_scale_inv.data,
+                    recipe=(1, 1, 128),
+                )
         if not self._postmix_in_quant:
             # The mix is over heads and the inverse RoPE rotates every head the
             # same way, so mixing before the parent's inverse RoPE is equivalent.
@@ -345,7 +473,26 @@ class Ernie5_5HcaAttention(Ernie5_5GatedQMixin, MQALayer):
         )
 
     def _project_wo_b(self, o, defer_all_reduce: bool = False):
-        o = fused_sigmoid_mul(o.flatten(1), self._take_gate(), round_sigmoid=True)
+        if self.gate_merged_into_wq_b:
+            gate = self._take_gate()
+        else:
+            # Split layout (internal _gate_wo_b_input): the side-stream gate
+            # joined by take_gate, else gate_proj on the main stream now.
+            assert self._gate_input is not None, "gate input (q_norm out) not captured"
+            gate = self._ll.take_gate() if self._ll is not None else None
+            if gate is None:
+                gate, _ = self.gate_proj(self._gate_input)
+            self._gate_input = None
+        # LowLatency: fold sigmoid-gate-mul into wo_b's fp8 input quant. The seam
+        # returns (fp8, uint8) wo_b's group-32 LL GEMM consumes, bypassing the
+        # bf16 gated_o round trip; super()._project_wo_b forwards the tuple to
+        # wo_b unchanged (it only flattens real tensors). None keeps the stock
+        # fused_sigmoid_mul. Mirrors internal _gate_wo_b_input.
+        if self._ll is not None:
+            fused = self._ll.gate_mul_g32(o.flatten(1), gate)
+            if fused is not None:
+                return super()._project_wo_b(fused[0], defer_all_reduce)
+        o = fused_sigmoid_mul(o.flatten(1), gate, round_sigmoid=True)
         return super()._project_wo_b(o, defer_all_reduce)
 
 
@@ -358,8 +505,18 @@ class Ernie5_5MlaAttention(DeepseekV2AttentionMLA):
         layer_id: int,
         quant_config: Optional[QuantizationConfig],
         prefix: str,
+        alt_streams=None,
     ):
+        # SGLANG_ERNIE55_MLA_SWAPAB: the gate GEMM and the stock qk-norm / indexer
+        # overlaps take the model's first side stream (internal alt_stream).
+        from sglang.srt.models.ernie55_swapab_dsa import mla_swapab_enabled
+
+        swapab = mla_swapab_enabled()
+        alt_stream_kwargs = (
+            {"alt_stream": alt_streams[0] if alt_streams else None} if swapab else {}
+        )
         super().__init__(
+            **alt_stream_kwargs,
             config=config,
             hidden_size=config.hidden_size,
             num_heads=config.hybrid_mla_num_attention_heads,
@@ -402,8 +559,66 @@ class Ernie5_5MlaAttention(DeepseekV2AttentionMLA):
         )
         self.postmix = VhaPostMix(self.num_local_heads, self.num_heads)
         self._gate: Optional[torch.Tensor] = None
+        self._ll_dsa = None
+        if swapab:
+            self._init_ll_dsa(alt_streams)
+
+    def _init_ll_dsa(self, alt_streams) -> None:
+        """SGLANG_ERNIE55_MLA_SWAPAB: the internal LL DSA layer (fused q_a norm +
+        g32 quant, multi-lane prepare, side-stream gate, gathered postmix)."""
+        from sglang.srt.models.ernie55_ll_dsa import (
+            Ernie55LLDsaPrepare,
+            _FusedQALayerNorm,
+            install_indexer_hooks,
+        )
+
+        self.attn_alt_streams = alt_streams
+        # Owner set via __dict__ so it is not a submodule.
+        self.q_a_layernorm.__class__ = _FusedQALayerNorm
+        self.q_a_layernorm.__dict__["_eb5_owner"] = self
+        self._q_lora_prequant = None
+        self._gate_input: Optional[torch.Tensor] = None
+        self._ll_dsa = Ernie55LLDsaPrepare(self)
+        install_indexer_hooks(self.indexer)
+        if _heads_are_split():
+            # The global [H, H] postmix every rank applies to the gathered heads.
+            self.register_buffer(
+                "_eb5_full_mix",
+                torch.eye(self.num_heads, dtype=self.postmix.vha_postmix_U.dtype),
+                persistent=False,
+            )
+            self._eb5_full_mix_built = False
+
+    def _fused_q_a_norm(self, q: torch.Tensor) -> Optional[torch.Tensor]:
+        from sglang.srt.models.ernie55_ll_dsa import fused_q_a_norm
+
+        return fused_q_a_norm(self, q)
+
+    def _clear_q_lora_prequant(self) -> None:
+        self._q_lora_prequant = None
+        self.indexer.wq_b._shared_q_prequant = None
+
+    def prepare_qkv_latent(self, hidden_states, forward_batch):
+        handoff = getattr(self, "_x_quant_handoff", None)
+        if (
+            self._ll_dsa is not None
+            and handoff is not None
+            and self.has_fused_proj
+            and not hasattr(self, "q_a_proj")
+        ):
+            # The MoE-side fused mHC kernel's group-32 tuple of hidden_states.
+            return self.fused_qkv_a_proj_with_mqa(handoff)[0]
+        return super().prepare_qkv_latent(hidden_states, forward_batch)
 
     def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
+        if self._ll_dsa is not None:
+            # The gate GEMM runs in forward_absorb_core (internal forward_core).
+            self._gate_input = q_lora
+            pre = self._q_lora_prequant
+            if pre is not None:
+                q = self.q_b_proj(pre)[0]
+                return q.view(-1, self.num_local_heads, self.qk_head_dim)
+            return super().q_b_proj_forward(q_lora)
         # The only hook that receives the normalized q-LoRA latent the gate reads.
         if self._gate is not None:
             raise RuntimeError(
@@ -418,6 +633,8 @@ class Ernie5_5MlaAttention(DeepseekV2AttentionMLA):
         return hidden_states
 
     def forward_absorb_prepare(self, *args, **kwargs):
+        if self._ll_dsa is not None:
+            return self._ll_dsa_absorb_prepare(*args, **kwargs)
         inner_state = super().forward_absorb_prepare(*args, **kwargs)
         gate, self._gate = self._gate, None
         if gate is None:
@@ -427,12 +644,121 @@ class Ernie5_5MlaAttention(DeepseekV2AttentionMLA):
         return (*inner_state[:-1], gate)
 
     def apply_attention_output_gate(self, attn_out, gate):
+        if self._ll_dsa is not None:
+            return self._ll_dsa_apply_gate(attn_out, gate)
         return fused_sigmoid_mul(self.postmix(attn_out), gate, round_sigmoid=True)
 
-    def forward(self, positions, hidden_states, forward_batch, zero_allocator):
+    def _ll_dsa_absorb_prepare(
+        self,
+        positions,
+        hidden_states,
+        forward_batch,
+        zero_allocator,
+        llama_4_scaling=None,
+        prev_topk_indices=None,
+    ):
+        """SGLANG_ERNIE55_MLA_SWAPAB prepare: the LL multi-lane prepare when it
+        applies, else the stock one; the last slot carries the gate input."""
+        inner = self._ll_dsa.prepare(
+            positions,
+            hidden_states,
+            forward_batch,
+            zero_allocator,
+            llama_4_scaling,
+            prev_topk_indices,
+        )
+        if inner is None:
+            inner = super().forward_absorb_prepare(
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                llama_4_scaling,
+                prev_topk_indices,
+            )[:-1]
+        gate_input, self._gate_input = self._gate_input, None
+        if gate_input is None:
+            raise RuntimeError(
+                "the q-LoRA latent for the output gate was not captured"
+            )
+        return (*inner, gate_input)
+
+    def forward_absorb_core(self, *args):
+        if self._ll_dsa is None:
+            return super().forward_absorb_core(*args)
+        from sglang.srt.layers.quantization.ernie55_halops_ll_gemm import (
+            g32_prequant_ready,
+        )
+        from sglang.srt.model_executor.runner import get_is_capture_mode
+        from sglang.srt.models.ernie55_ll_dsa import _DeferredGate
+
+        try:
+            gate_input = args[-1]
+            pre = self._q_lora_prequant
+            if pre is not None and g32_prequant_ready(self.gate_proj, pre[0].shape[0]):
+                gate_input = pre
+            alt = self.alt_stream
+            if alt is not None and get_is_capture_mode():
+                current = torch.cuda.current_stream()
+                for t in gate_input if isinstance(gate_input, tuple) else (gate_input,):
+                    t.record_stream(alt)
+                alt.wait_stream(current)
+                with torch.cuda.stream(alt):
+                    gate, _ = self.gate_proj(gate_input)
+                gate = _DeferredGate(gate, alt)
+            else:
+                gate, _ = self.gate_proj(gate_input)
+            with self._ll_dsa.core():
+                return super().forward_absorb_core(*args[:-1], gate)
+        finally:
+            self._gate_input = None
+            self._clear_q_lora_prequant()
+
+    def _ll_dsa_apply_gate(self, attn_out, gate):
+        from sglang.kernels.ops.attention.dsv4.ernie55_sigmoid_gate_mul import (
+            covered,
+            ernie55_sigmoid_gate_mul,
+        )
+        from sglang.srt.models.ernie55_ll_dsa import (
+            _DeferredGate,
+            build_full_mix,
+            gathered_postmix,
+        )
+
+        full_mix = getattr(self, "_eb5_full_mix", None)
+        if (
+            full_mix is not None
+            and not self._eb5_full_mix_built
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            # A model whose post_load_weights does not build it (the MTP draft).
+            build_full_mix(self.postmix, full_mix)
+            self._eb5_full_mix_built = True
+        if full_mix is not None and self._eb5_full_mix_built:
+            o = gathered_postmix(full_mix, attn_out, self.num_heads)
+        else:
+            o = self.postmix(attn_out)
+        if isinstance(gate, _DeferredGate):
+            gate = gate.join()
+        if covered(o, gate):
+            return ernie55_sigmoid_gate_mul(o, gate)
+        return fused_sigmoid_mul(o, gate, round_sigmoid=True)
+
+    def forward(
+        self,
+        positions,
+        hidden_states,
+        forward_batch,
+        zero_allocator,
+        x_quant=None,
+        defer_all_reduce: bool = False,
+    ):
         get_attn_tp_context().set_attn_inputs(
             AttentionInputs(hidden_states, forward_batch, self.prepare_qkv_latent)
         )
+        # The MoE-side fused mHC kernel's group-32 (fp8, uint8) of hidden_states,
+        # left for this forward's q/kv-a projection; unused when it is not read.
+        self._x_quant_handoff = x_quant
         try:
             with get_attn_backend().mla_layer_context():
                 out = super().forward(
@@ -440,10 +766,13 @@ class Ernie5_5MlaAttention(DeepseekV2AttentionMLA):
                 )
         finally:
             get_attn_tp_context().clear_attn_inputs()
+            self._x_quant_handoff = None
         # The DSA layer also returns top-k indices; no layer reuses them here.
         out = out[0] if isinstance(out, tuple) else out
-        # The decoder layer has no boundary reduce to defer the head sum to.
-        return attn_tp_all_reduce(out) if _heads_are_split() else out
+        if not _heads_are_split():
+            return out
+        # Deferred: the attention-side fused mHC kernel reduces the head sum.
+        return AttnOutput(out) if defer_all_reduce else attn_tp_all_reduce(out)
 
 
 class Ernie5_5MLP(nn.Module):
@@ -497,6 +826,11 @@ class Ernie5_5Moe(nn.Module):
         super().__init__()
         self.alt_stream = alt_stream
         self.layer_id = layer_id
+        self.config = config
+        # The fused TP MoE kernel's combining AllReduce completes a TP-sharded shared
+        # expert for free; when it is on and eligible, shard the shared expert and let
+        # ``complete_shared_output`` AllReduce the partial on every other path.
+        self._shared_sharded = shared_expert_sharded(self)
         self.num_experts = config.n_routed_experts
         latent_size = config.moe_latent_size
         self.latent_size = latent_size
@@ -541,7 +875,7 @@ class Ernie5_5Moe(nn.Module):
             config.moe_intermediate_size * config.n_shared_experts,
             quant_config,
             add_prefix("shared_experts", prefix),
-            parallel_group="replicated",
+            parallel_group=None if self._shared_sharded else "replicated",
             reduce_results=False,
         )
         self.fc1_latent_proj = ReplicatedLinear(
@@ -559,6 +893,9 @@ class Ernie5_5Moe(nn.Module):
             prefix=add_prefix("fc2_latent_proj", prefix),
         )
         self.latent_norm = RMSNorm(latent_size, eps=config.rms_norm_eps)
+        # Built last: reads the modules above and rendezvouses its symmetric
+        # workspace (collective, once per process) at model build.
+        self._mega_moe = Ernie55MegaMoE(self)
 
     def _route(self, hidden_states, gating_output, topk, renormalize):
         # gating_output is the raw [T, 2E] gate|gate_1 GEMM output.
@@ -584,6 +921,10 @@ class Ernie5_5Moe(nn.Module):
                 ),
             )
             return hidden_states
+        # The fused TP MoE kernel runs the whole layer MoE (router .. tail, shared
+        # expert and cross-rank AllReduce included) in one launch on the decode path.
+        if self._mega_moe.should_run(hidden_states.shape[0]):
+            return self._mega_moe.run(hidden_states)
         shared = None
         in_dispatch = None
         # A breakable graph's eager break inside the routed experts would leave one
@@ -621,7 +962,7 @@ class Ernie5_5Moe(nn.Module):
             torch.cuda.current_stream().wait_stream(self.alt_stream)
             # Allocated on alt_stream, consumed on the main one.
             shared.record_stream(torch.cuda.current_stream())
-        return routed + shared
+        return routed + complete_shared_output(self, shared)
 
     def _shared_experts_in_dispatch(self, hidden_states: torch.Tensor) -> list:
         """Run the shared expert in the eager DeepEP dispatch hook (after quantize,
@@ -682,6 +1023,8 @@ class Ernie5_5DecoderLayer(nn.Module):
 
         # Fuse the input RMSNorm into mhc_pre; not bit-exact with the eager norm.
         self.fuse_input_norm = envs.SGLANG_OPT_ERNIE5_5_FUSE_INEXACT.get()
+        # Fuse attention mHC-post + FFN mHC-pre into one mhc_fused_post_pre launch.
+        self.fuse_mhc_post_pre = envs.SGLANG_ERNIE55_FUSE_MHC_POST_PRE.get()
         self.hc_mult = config.hc_mult
         (
             self.hc_attn_fn,
@@ -691,11 +1034,27 @@ class Ernie5_5DecoderLayer(nn.Module):
             self.hc_attn_scale,
             self.hc_ffn_scale,
         ) = make_hc_mixing_params(self.hc_mult, config.hidden_size)
+        # SGLANG_ERNIE55_FUSED_AR_MHC: the cross-layer fused all-reduce + mHC
+        # kernels (ernie55_fused_ar_mhc_dispatch), both sides off when unset.
+        self.layer_id = layer_id
+        self.fused_ar_mhc_attn_gate, self.fused_ar_mhc_moe_gate = (
+            ar_mhc.resolve_gates(
+                hc_mult=self.hc_mult,
+                hidden_size=config.hidden_size,
+                mhc_fuse_post_pre=envs.SGLANG_ERNIE55_SINGLE_BATCH_LL.get(),
+                fuse_input_norm=self.fuse_input_norm,
+            )
+        )
+        self.attn_input_quant_consumers = (
+            self._attn_input_linears() if self.fused_ar_mhc_moe_gate.enabled else ()
+        )
 
     @staticmethod
     def _build_self_attn(config, layer_id, quant_config, prefix, alt_streams):
         if layer_id in config.mla_layer_ids:
-            return Ernie5_5MlaAttention(config, layer_id, quant_config, prefix)
+            return Ernie5_5MlaAttention(
+                config, layer_id, quant_config, prefix, alt_streams=alt_streams
+            )
         return Ernie5_5HcaAttention(config, layer_id, quant_config, prefix, alt_streams)
 
     def _hc_pre(self, residual, fn, scale, base, norm):
@@ -730,6 +1089,153 @@ class Ernie5_5DecoderLayer(nn.Module):
         if x.shape[0] == 0:
             return torch.empty_like(residual)
         return mhc_post(x, residual, post, comb)
+
+    def _hc_post_pre(self, x, residual, post, comb, fn, scale, base, norm):
+        """Fuse one sublayer's mhc_post with the next sublayer's mhc_pre in a
+        single launch. Equivalent to ``_hc_pre(_hc_post(x, residual, post, comb),
+        fn, scale, base, norm)`` but without the post/pre boundary. Returns
+        ``(layer_input, new_residual, post, comb)`` where ``new_residual`` is the
+        post-mapped residual the following mhc_post consumes."""
+        new_residual, post, comb, layer_input = mhc_fused_post_pre(
+            x,
+            residual,
+            post,
+            comb,
+            fn,
+            scale,
+            base,
+            rms_eps=self.config.rms_norm_eps,
+            hc_pre_eps=self.config.hc_eps,
+            hc_sinkhorn_eps=self.config.hc_eps,
+            hc_post_mult_value=self.config.hc_post_mult_value,
+            sinkhorn_repeat=self.config.hc_sinkhorn_iters,
+            eps_outside_sqrt=True,
+            norm_weight=norm.weight if self.fuse_input_norm else None,
+            norm_eps=norm.variance_epsilon if self.fuse_input_norm else None,
+        )
+        if not self.fuse_input_norm:
+            layer_input = exact_rms_norm(layer_input, norm)
+        return layer_input, new_residual, post, comb
+
+    def _attn_input_linears(self) -> tuple:
+        """Linears that read the attention input first. The MoE-side kernel's
+        group-32 tuple reaches the attention only when all of them take it; empty
+        means never."""
+        from sglang.srt.models.deepseek_v4 import MqaAttentionBase
+
+        attn = self.self_attn
+        if isinstance(attn, MqaAttentionBase):
+            return (attn.wqkv_a,) if attn.fuse_wqa_wkv else (attn.wq_a, attn.wkv)
+        if isinstance(attn, Ernie5_5MlaAttention) and attn.has_fused_proj:
+            return (attn.fused_qkv_a_proj_with_mqa,)
+        return ()
+
+    def _fused_ar_mhc_runs(self, gate, forward_batch: ForwardBatch, num_tokens):
+        """Whether this forward runs ``gate``'s fused kernel (rank-invariant)."""
+        if not gate.enabled:
+            return False
+        return gate.runs(
+            num_tokens=num_tokens,
+            small_path=ar_mhc.small_path(num_tokens),
+            prefill_cp=is_cp_active(forward_batch),
+        )
+
+    def _plan_deferral(self, *, attn_runs: bool, moe_runs: bool):
+        """Which sinkhorns this forward defers (``ar_mhc.SinkhornDeferral``)."""
+        return ar_mhc.plan_deferral(attn_runs=attn_runs, moe_runs=moe_runs)
+
+    def _run_fused_ar_mhc(
+        self, gate, x, residual, post, comb, *, fn, scale, base, norm, **extra
+    ):
+        return gate.run(
+            x.reshape(-1, self.config.hidden_size),
+            residual,
+            post,
+            comb,
+            fn,
+            scale,
+            base,
+            norm.weight,
+            rms_eps=self.config.rms_norm_eps,
+            hc_pre_eps=self.config.hc_eps,
+            # The checkpoint uses one epsilon for both.
+            hc_sinkhorn_eps=self.config.hc_eps,
+            hc_post_mult_value=self.config.hc_post_mult_value,
+            sinkhorn_repeat=self.config.hc_sinkhorn_iters,
+            norm_eps=norm.variance_epsilon,
+            # PaddleFleet-trained mHC: eps outside the sqrt, exp2 sinkhorn.
+            mhc_align_fleet=True,
+            **extra,
+        )
+
+    def _fused_ar_mhc_attn(self, partial, residual, post, comb, *, defer):
+        """Attention all-reduce + mhc_post + FFN mhc_pre + quant in one kernel:
+        (residual, mlp_input, mlp_post, mlp_comb, (q, sf)). With ``defer.ffn`` the
+        comb slot is a DeferredSinkhorn of the FFN comb logits."""
+        out = self._run_fused_ar_mhc(
+            self.fused_ar_mhc_attn_gate,
+            partial,
+            residual,
+            post,
+            comb,
+            fn=self.hc_ffn_fn,
+            scale=self.hc_ffn_scale,
+            base=self.hc_ffn_base,
+            norm=self.post_attention_layernorm,
+            comb_is_logits=defer.attn,
+            emit_logits=defer.ffn,
+        )
+        if not defer.ffn:
+            return out
+        residual_out, mlp_input, mlp_post, ffn_logits, quant = out
+        deferred = ar_mhc.DeferredSinkhorn(
+            gate=self.fused_ar_mhc_attn_gate,
+            logits=ffn_logits,
+            eps=self.config.hc_eps,
+            repeat=self.config.hc_sinkhorn_iters,
+            align_fleet=True,
+        )
+        return residual_out, mlp_input, mlp_post, deferred, quant
+
+    def _fused_ar_mhc_moe(self, mlp_output, residual, post, comb, *, emit_logits):
+        """The previous layer's FFN mhc_post + this layer's attention mhc_pre +
+        quant in one kernel (no all-reduce: the MoE output is already reduced):
+        (residual, attn_input, attn_post, attn_comb, (q, sf)). With
+        ``emit_logits`` the comb slot holds the attention comb logits."""
+        ar_mhc.log_moe_variant(
+            layer_id=self.layer_id, has_shared=False, num_tokens=mlp_output.shape[0]
+        )
+        return self._run_fused_ar_mhc(
+            self.fused_ar_mhc_moe_gate,
+            mlp_output,
+            residual,
+            post,
+            comb,
+            fn=self.hc_attn_fn,
+            scale=self.hc_attn_scale,
+            base=self.hc_attn_base,
+            norm=self.input_layernorm,
+            emit_logits=emit_logits,
+        )
+
+    def fused_ar_mhc_moe_weights(self) -> Tuple[torch.Tensor, ...]:
+        """The weights ``_fused_ar_mhc_moe`` reads: hc_attn fn / scale / base and
+        the input RMSNorm weight."""
+        return (
+            self.hc_attn_fn,
+            self.hc_attn_scale,
+            self.hc_attn_base,
+            self.input_layernorm.weight,
+        )
+
+    def _hc_post_then_pre(self, x, residual, post, comb, fn, scale, base, norm):
+        """An unfused chain boundary, as ``forward`` runs it: (layer_input,
+        new_residual, post, comb)."""
+        if self.fuse_mhc_post_pre and residual.shape[0] != 0:
+            return self._hc_post_pre(x, residual, post, comb, fn, scale, base, norm)
+        new_residual = self._hc_post(x, residual, post, comb)
+        layer_input, post, comb = self._hc_pre(new_residual, fn, scale, base, norm)
+        return layer_input, new_residual, post, comb
 
     def ffn_reads_own_rows(self) -> bool:
         """True if each row's FFN output depends on that row alone."""
@@ -807,9 +1313,30 @@ class Ernie5_5DecoderLayer(nn.Module):
         forward_batch: ForwardBatch,
         zero_allocator: BumpAllocator,
         out_rows: Optional[torch.Tensor] = None,
+        *,
+        prev_residual: Optional[torch.Tensor] = None,
+        prev_post: Optional[torch.Tensor] = None,
+        prev_comb: Optional[torch.Tensor] = None,
+        defer_ffn_hc_post: bool = False,
+        next_attn_inputs: Optional[Tuple[torch.Tensor, ...]] = None,
     ) -> torch.Tensor:
         """Only ``out_rows`` continue past attention (KV is still written for all);
-        needs ffn_reads_own_rows()."""
+        needs ffn_reads_own_rows(). The keyword-only arguments are the
+        cross-layer mHC chain of ``Ernie5_5Model._forward_mhc_chain``."""
+        if prev_residual is not None or defer_ffn_hc_post:
+            if out_rows is not None:
+                raise ValueError("the cross-layer mHC chain does not take out_rows")
+            return self._forward_fused_chain(
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                prev_residual=prev_residual,
+                prev_post=prev_post,
+                prev_comb=prev_comb,
+                defer_ffn_hc_post=defer_ffn_hc_post,
+                next_attn_inputs=next_attn_inputs,
+            )
         x, post, comb = self._hc_pre(
             hidden_states,
             self.hc_attn_fn,
@@ -824,17 +1351,132 @@ class Ernie5_5DecoderLayer(nn.Module):
         if out_rows is not None:
             x, hidden_states = x[out_rows], hidden_states[out_rows]
             post, comb = post[out_rows], comb[out_rows]
-        hidden_states = self._hc_post(x, hidden_states, post, comb)
-
-        x, post, comb = self._hc_pre(
-            hidden_states,
-            self.hc_ffn_fn,
-            self.hc_ffn_scale,
-            self.hc_ffn_base,
-            self.post_attention_layernorm,
-        )
+        if self.fuse_mhc_post_pre and hidden_states.shape[0] != 0:
+            # One launch for attention mHC-post + FFN mHC-pre.
+            x, hidden_states, post, comb = self._hc_post_pre(
+                x,
+                hidden_states,
+                post,
+                comb,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.post_attention_layernorm,
+            )
+        else:
+            hidden_states = self._hc_post(x, hidden_states, post, comb)
+            x, post, comb = self._hc_pre(
+                hidden_states,
+                self.hc_ffn_fn,
+                self.hc_ffn_scale,
+                self.hc_ffn_base,
+                self.post_attention_layernorm,
+            )
         x = self._forward_ffn(x, forward_batch)
         return self._hc_post(x, hidden_states, post, comb)
+
+    def _forward_fused_chain(
+        self,
+        positions,
+        hidden_states,
+        forward_batch,
+        zero_allocator,
+        *,
+        prev_residual,
+        prev_post,
+        prev_comb,
+        defer_ffn_hc_post,
+        next_attn_inputs,
+    ):
+        """One layer of the cross-layer mHC chain (internal EB5DecoderLayer.forward
+        with prev_*): ``hidden_states`` is the previous layer's FFN output when
+        ``prev_residual`` is given, else the mHC streams. Each boundary runs its
+        fused kernel when that side's gate runs, else the unfused mHC ops."""
+        num_tokens = hidden_states.shape[0]
+        moe_fused = prev_residual is not None and self._fused_ar_mhc_runs(
+            self.fused_ar_mhc_moe_gate, forward_batch, num_tokens
+        )
+        attn_fused = self._fused_ar_mhc_runs(
+            self.fused_ar_mhc_attn_gate, forward_batch, num_tokens
+        )
+        defer = self._plan_deferral(attn_runs=attn_fused, moe_runs=moe_fused)
+        attn_input_quant = None
+        if moe_fused:
+            # With defer.attn, comb is the logits only the attention-side kernel reads.
+            residual, x, post, comb, attn_input_quant = self._fused_ar_mhc_moe(
+                hidden_states, prev_residual, prev_post, prev_comb,
+                emit_logits=defer.attn,
+            )  # fmt: skip
+        elif prev_residual is not None:
+            x, residual, post, comb = self._hc_post_then_pre(
+                hidden_states, prev_residual, prev_post, prev_comb,
+                self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+                self.input_layernorm,
+            )  # fmt: skip
+        else:
+            residual = hidden_states
+            x, post, comb = self._hc_pre(
+                residual, self.hc_attn_fn, self.hc_attn_scale, self.hc_attn_base,
+                self.input_layernorm,
+            )  # fmt: skip
+        x_quant = ar_mhc.accepted_input_quant(
+            attn_input_quant,
+            consumers=self.attn_input_quant_consumers,
+            num_tokens=num_tokens,
+        )
+        if isinstance(self.self_attn, Ernie5_5MlaAttention):
+            out = self.self_attn(
+                positions, x, forward_batch, zero_allocator,
+                x_quant=x_quant, defer_all_reduce=attn_fused,
+            )  # fmt: skip
+        else:
+            out = self.self_attn(
+                x, positions, forward_batch,
+                x_quant=x_quant, defer_all_reduce=attn_fused,
+            )  # fmt: skip
+        deferred = None
+        if attn_fused:
+            if not isinstance(out, AttnOutput):
+                raise RuntimeError(
+                    f"SGLANG_ERNIE55_FUSED_AR_MHC=1: layer {self.layer_id}'s "
+                    "attention reduced its own output; the fused kernel needs the "
+                    "un-reduced partial"
+                )
+            self.fused_ar_mhc_attn_gate.check_ll_push(out.partial)
+            # The (q, sf) pair is unused: the mega MoE quantizes its bf16 input.
+            residual, x, post, comb, _ = self._fused_ar_mhc_attn(
+                out.partial, residual, post, comb, defer=defer
+            )
+            if isinstance(comb, ar_mhc.DeferredSinkhorn):
+                deferred, comb = comb, None
+        else:
+            x, residual, post, comb = self._hc_post_then_pre(
+                out, residual, post, comb,
+                self.hc_ffn_fn, self.hc_ffn_scale, self.hc_ffn_base,
+                self.post_attention_layernorm,
+            )  # fmt: skip
+        pending = None
+        if deferred is not None:
+            moe_path = isinstance(self.mlp, Ernie5_5Moe) and (
+                not get_moe_a2a_backend().is_none()
+                or get_parallel().attn_dp_size <= 1
+            )
+            if moe_path:
+                # Internal forks after its MoE's gemm2; the open MoE is one launch
+                # with no such hook, so the FFN comb sinkhorn (and the L2 prefetch
+                # of what the next layer's MoE-side kernel reads) forks here.
+                deferred = ar_mhc.add_l2_prefetch(
+                    deferred, next_inputs=next_attn_inputs, residual=residual, post=post
+                )
+            pending = deferred.launch()
+        x = self._forward_ffn(x, forward_batch)
+        if pending is not None:
+            # Every reader of comb comes after this: the next layer's MoE side,
+            # the model loop's hc mean / last hc_post, or the hc_post below.
+            comb = pending.join()
+        if defer_ffn_hc_post:
+            return x, residual, post, comb
+        return self._hc_post(x, residual, post, comb)
 
 
 class Ernie5_5Model(nn.Module):
@@ -907,14 +1549,25 @@ class Ernie5_5Model(nn.Module):
         )
         captures = self.dspark_layers_to_capture or ()
         aux_hidden_states = []
-        for layer_id in range(self.start_layer, self.end_layer):
-            hidden_states = self.layers[layer_id](
-                positions, hidden_states, forward_batch, zero_allocator
-            )
-            if layer_id in captures:
-                # The draft reads layer i's output, not its input, as the mean
-                # of the mHC streams, as it was trained.
-                aux_hidden_states.append(hidden_states.mean(dim=1))
+        if (
+            self.start_layer < self.end_layer
+            and hidden_states.shape[0] > 0
+            and self.layers[self.start_layer].fused_ar_mhc_attn_gate.enabled
+            and not is_cp_active(forward_batch)
+        ):
+            hidden_states = self._forward_mhc_chain(
+                positions, hidden_states, forward_batch, zero_allocator, captures,
+                aux_hidden_states,
+            )  # fmt: skip
+        else:
+            for layer_id in range(self.start_layer, self.end_layer):
+                hidden_states = self.layers[layer_id](
+                    positions, hidden_states, forward_batch, zero_allocator
+                )
+                if layer_id in captures:
+                    # The draft reads layer i's output, not its input, as the
+                    # mean of the mHC streams, as it was trained.
+                    aux_hidden_states.append(hidden_states.mean(dim=1))
         if not self.pp_group.is_last_rank:
             return PPProxyTensors({"hidden_states": hidden_states.flatten(1)})
         pre_hc_head = hidden_states.flatten(1)
@@ -928,6 +1581,46 @@ class Ernie5_5Model(nn.Module):
         if rows is not None:
             hidden_states = scatter_rows(hidden_states, rows, pre_hc_head.shape[0])
         return hidden_states, pre_hc_head, aux_hidden_states
+
+    def _next_attn_inputs(self, i: int) -> Optional[Tuple[torch.Tensor, ...]]:
+        """Layer i + 1's MoE-side kernel weights, which layer i L2-prefetches when
+        it runs the attention-side kernel, else None."""
+        if (
+            i + 1 >= self.end_layer
+            or not self.layers[i].fused_ar_mhc_attn_gate.enabled
+            or not self.layers[i + 1].fused_ar_mhc_moe_gate.enabled
+        ):
+            return None
+        return self.layers[i + 1].fused_ar_mhc_moe_weights()
+
+    def _forward_mhc_chain(
+        self, positions, hidden_states, forward_batch, zero_allocator, captures, aux
+    ):
+        """The layers with each FFN mhc_post carried into the next layer
+        (internal's cross-layer mHC loop), so the FFN -> attention boundary can
+        run the MoE-side fused kernel; returns the last layer's mHC streams."""
+        from sglang.kernels.ops.attention.dsv4.ernie55_fused_ar_mhc import (
+            mhc_post_hc_mean,
+        )
+
+        residual = post = comb = None
+        for layer_id in range(self.start_layer, self.end_layer):
+            layer = self.layers[layer_id]
+            hidden_states, residual, post, comb = layer(
+                positions,
+                hidden_states,
+                forward_batch,
+                zero_allocator,
+                prev_residual=residual,
+                prev_post=post,
+                prev_comb=comb,
+                defer_ffn_hc_post=True,
+                next_attn_inputs=self._next_attn_inputs(layer_id),
+            )
+            if layer_id in captures:
+                # mhc_post(...).mean(dim=1) without the [T, 4, H] streams.
+                aux.append(mhc_post_hc_mean(hidden_states, residual, post, comb))
+        return layer._hc_post(hidden_states, residual, post, comb)
 
 
 class Ernie5_5LogitsProcessor(LogitsProcessor):
@@ -1046,6 +1739,19 @@ class Ernie5_5_MoeForCausalLM(nn.Module):
         DeepseekV2WeightLoaderMixin.post_load_weights(self)
         for layer in self.model.layers[self.start_layer : self.end_layer]:
             layer.self_attn.postmix.fold()
+        self._build_mla_full_mix()
+
+    def _build_mla_full_mix(self) -> None:
+        """SGLANG_ERNIE55_MLA_SWAPAB with attention TP: gather every MLA layer's
+        U/V shards into its global [H, H] postmix (in place, graph-safe)."""
+        from sglang.srt.models.ernie55_ll_dsa import build_full_mix
+
+        for layer in self.model.layers[self.start_layer : self.end_layer]:
+            attn = layer.self_attn
+            if getattr(attn, "_eb5_full_mix", None) is None:
+                continue
+            build_full_mix(attn.postmix, attn._eb5_full_mix)
+            attn._eb5_full_mix_built = True
 
 
 # wo_a's fp8 block edge, as fp8_einsum's recipe=(1, 128, 128) reads it.
@@ -1100,8 +1806,17 @@ def _store_fp8_wo_a(
 ) -> None:
     """Write a rank's fp8 ``wo_a`` and its scale in the layout ``fp8_einsum`` reads."""
     wo_a = attn.wo_a
-    # In place: a captured CUDA graph holds the weight's address.
-    wo_a.weight.data.copy_(weight)
+    # In place when the param already holds fp8 (serialized ckpt, or a reload a
+    # captured CUDA graph still points at). The online path created wo_a.weight as
+    # BF16 (so the loader could receive a BF16 shard), so the first fp8 write has
+    # to rebind the parameter's storage to the fp8 tensor instead.
+    if (
+        wo_a.weight.data.dtype == weight.dtype
+        and wo_a.weight.data.shape == weight.shape
+    ):
+        wo_a.weight.data.copy_(weight)
+    else:
+        wo_a.weight.data = weight
     scale = scale.to(device=wo_a.weight.device, dtype=torch.float32)
     if DEEPGEMM_SCALE_UE8M0:
         from deep_gemm import transform_sf_into_required_layout
@@ -1182,6 +1897,11 @@ class Ernie5_5WeightLoader:
     _HCA_MERGED_SHARDS = {
         "self_attn.linear_q_up_proj.weight": ("self_attn.wq_b.weight", 0),
         "self_attn.gate_proj.weight": ("self_attn.wq_b.weight", 1),
+    }
+    # SGLANG_ERNIE55_HCA_SPLIT_GATE layers (gate_merged_into_wq_b False): q_up is
+    # MQALayer's plain wq_b; self_attn.gate_proj loads under its own name.
+    _HCA_SPLIT_GATE_RENAMES = {
+        "self_attn.linear_q_up_proj.weight": "self_attn.wq_b.weight",
     }
     _MERGED_SHARDS = {
         "mlp.gate_proj.weight": ("mlp.gate_up_proj.weight", 0),
@@ -1319,7 +2039,13 @@ class Ernie5_5WeightLoader:
             return
         merged = self._MERGED_SHARDS
         if layer_id not in self.mla_layers:
-            merged = {**merged, **self._HCA_MERGED_SHARDS}
+            if getattr(self.layers[layer_id].self_attn, "gate_merged_into_wq_b", True):
+                merged = {**merged, **self._HCA_MERGED_SHARDS}
+            elif suffix in self._HCA_SPLIT_GATE_RENAMES:
+                # Split gate: q_up fills MQALayer's wq_b, gate_proj its own name.
+                target = self._HCA_SPLIT_GATE_RENAMES[suffix]
+                self._load(prefix + target + scale_suffix, tensor)
+                return
         if suffix in merged:
             target, shard_id = merged[suffix]
             self._load(prefix + target + scale_suffix, tensor, shard_id)
@@ -1422,9 +2148,27 @@ class Ernie5_5WeightLoader:
                 "fp8 weights or block scales without the other half: "
                 f"{sorted(pending)[:8]}"
             )
-        # Not loaded by name: wo_a's block scale (written with its weight) and the
-        # KV cache scales.
-        derived = ("self_attn.wo_a.weight_scale_inv", ".k_scale", ".v_scale")
+        # Not loaded by name, derived after loading from the bf16/fp8 weights:
+        # wo_a's block scale (written with its weight), the KV cache scales, and —
+        # when a bf16 checkpoint is quantized online via --quantization fp8 — the
+        # per-tensor expert scales the FusedMoE fp8 method fills in
+        # process_weights_after_loading. A real fp8-serialized checkpoint instead
+        # ships blockwise `*_weight_scale_inv`, so the non-`_inv` names below only
+        # ever match the online path and never mask a genuinely missing scale.
+        derived = (
+            "self_attn.wo_a.weight_scale_inv",
+            ".k_scale",
+            ".v_scale",
+            "mlp.experts.w13_weight_scale",
+            "mlp.experts.w2_weight_scale",
+        )
+        # Online 128x128 blockwise-FP8 (--quantization fp8 on a BF16 checkpoint)
+        # derives every `*_weight_scale_inv` in process_weights_after_loading, so
+        # none of them ship in the checkpoint. A real fp8-serialized checkpoint
+        # loads them by name, so this exemption stays gated on the online flag and
+        # never masks a genuinely missing block scale.
+        if getattr(self.quant_config, "online_block_fp8", False):
+            derived = derived + ("weight_scale_inv",)
         missing = sorted(
             name
             for name in set(self.params) - self.loaded
